@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Verify that your DNS and HTTP redirects are working correctly.
+
+$ redirects-test.py https://lost.co.nz/ http://lost.co.nz http://www.lost.co.nz/
+Checking 3 URLs
+https://lost.co.nz/    -> 200
+http://lost.co.nz/     -> 301 -> https://lost.co.nz/ -> 200
+http://www.lost.co.nz/ -> 301 -> https://lost.co.nz/ -> 200
+"""
 
 import argparse
 from collections import defaultdict

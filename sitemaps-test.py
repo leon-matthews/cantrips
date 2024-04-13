@@ -1,4 +1,35 @@
 #!/usr/bin/env python3
+"""
+Test a website's sitemap.xml implementation.
+
+Download a website's sitemap.xml and all of the index files that it references,
+and report on how many links were found, and what sort of attributes they
+contained.
+
+For example::
+
+    $ sitemaps-test.py https://seabreezeapparel.co.nz/
+    Downloaded 685B from: https://seabreezeapparel.co.nz/sitemap.xml
+        7 URLs found is sitemap index.
+
+    Downloaded 877B from: https://seabreezeapparel.co.nz/sitemap-news.xml
+        Found 5 URLs, 5 lastmod, 0 changefreq, and 5 priority fields
+    Downloaded 154B from: https://seabreezeapparel.co.nz/sitemap-pages.xml
+        Found 0 URLs, 0 lastmod, 0 changefreq, and 0 priority fields
+    Downloaded 800B from: https://seabreezeapparel.co.nz/sitemap-inspiration.xml
+        Found 4 URLs, 4 lastmod, 0 changefreq, and 4 priority fields
+    Downloaded 1.6kB from: https://seabreezeapparel.co.nz/sitemap-brands.xml
+        Found 11 URLs, 11 lastmod, 0 changefreq, and 11 priority fields
+    Downloaded 2.2kB from: https://seabreezeapparel.co.nz/sitemap-collections.xml
+        Found 16 URLs, 16 lastmod, 0 changefreq, and 16 priority fields
+    Downloaded 69kB from: https://seabreezeapparel.co.nz/sitemap-products.xml
+        Found 495 URLs, 495 lastmod, 0 changefreq, and 495 priority fields
+    Downloaded 861B from: https://seabreezeapparel.co.nz/sitemap-static.xml
+        Found 6 URLs, 0 lastmod, 6 changefreq, and 6 priority fields
+
+    Total of 537 URLs found in 8 files
+
+"""
 
 import argparse
 from dataclasses import dataclass

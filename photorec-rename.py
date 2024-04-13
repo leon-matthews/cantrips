@@ -6,7 +6,8 @@ Better organise and rename files recovered by ``photorec``.
 Copies only good JPEG photos to another directory, using the EXIF date
 the photo was taken as the file name.
 
-See: https://www.cgsecurity.org/wiki/PhotoRec
+See:
+    https://www.cgsecurity.org/wiki/PhotoRec
 """
 
 import argparse
