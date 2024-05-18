@@ -8,6 +8,11 @@ Convenient and safe bulk renamer.
 * Performs dry-run by default
 * Pre-run check to avoid data loss caused by non-unique output names.
 
+TODO:
+
+    * Better error message with bad regex
+    * Add \index and \index0 special substitition (ie. 001, 002, ...)
+
 """
 
 import argparse
