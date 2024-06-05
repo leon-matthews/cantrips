@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 
 """
-Break a single-file audio book into separate MP3 files, one per chapter.
+Break a single-file audio book into separate MP3 files.
+
+I like to use listen to audiobooks while I work on DIY projects. I use cheap
+little MP3 players because phones are too expensive to replace when they get
+paint on them or get water-blasted.
 
 The original file is left untouched. Output files are written into a new
 directory in the same folder as the original file.
 
 Requires ffmpeg binaries, the Python package 'colorama', and chapter markers
 in the input file.
-"""
 
+TODO:
+    * Replace `colorama` for coloured output with `rich`.
+    * Refactor with on eye on responsibilities.
+
+"""
 
 import argparse
 from contextlib import contextmanager
@@ -17,17 +25,23 @@ import json
 import math
 import os
 from pathlib import Path
-from pprint import pprint as pp
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+from typing import Any, TypeAlias
 
 import colorama
 
 
+JsonList: TypeAlias = list[dict[str, Any]]
+
+
 class Chapteriser:
+    """
+    Break large single-file audio books into small MP3 files.
+    """
     def __init__(self, path, chapters, add_index=0, verbose=False):
         self.path = path
         self.add_index = add_index
@@ -130,7 +144,7 @@ class Chapteriser:
 
 class Print:
     @staticmethod
-    def it(string, *styles, **kwargs):
+    def it(string: str, *styles: Any, **kwargs: Any) -> None:
         """
         Print string using colorama styles in single operation.
 
@@ -144,53 +158,62 @@ class Print:
 
     # Styles ###########################
     @staticmethod
-    def command(string, prefix=''):
+    def command(string: str, prefix:str = ''):
         Print.cyan(f"{prefix}{string}")
 
     @staticmethod
-    def confirm(string):
+    def confirm(string: str) -> None:
         Print.yellow(string, end=' ')
 
     @staticmethod
-    def help(string):
+    def help(string: str) -> None:
         Print.yellow(string)
 
     @staticmethod
-    def progress(string, heading=False):
+    def progress(string: str, heading: bool = False) -> None:
         if heading:
             string = f"{f' {string} ':.^80}"
         Print.green(string)
 
     @staticmethod
-    def error(string):
+    def error(string: str) -> None:
         Print.red(string)
 
     # Colours ##########################
     @staticmethod
-    def cyan(string, **kwargs):
+    def cyan(string: str, **kwargs: Any) -> None:
         Print.it(string, colorama.Fore.CYAN)
 
     @staticmethod
-    def green(string, **kwargs):
+    def green(string: str, **kwargs: Any) -> None:
         Print.it(string, colorama.Fore.GREEN, colorama.Style.BRIGHT)
 
     @staticmethod
-    def magenta(string, **kwargs):
+    def magenta(string: str, **kwargs: Any) -> None:
         Print.it(string, colorama.Fore.MAGENTA, colorama.Style.BRIGHT)
 
     @staticmethod
-    def red(string, **kwargs):
+    def red(string: str, **kwargs: Any) -> None:
         Print.it(string, colorama.Fore.RED, colorama.Style.BRIGHT)
 
     @staticmethod
-    def yellow(string, **kwargs):
+    def yellow(string: str, **kwargs: Any) -> None:
         Print.it(string, colorama.Fore.YELLOW, colorama.Style.BRIGHT, **kwargs)
 
 
 @contextmanager
-def change_folder(folder, verbose=False):
+def change_folder(folder: Path, verbose: bool = False) -> None:
     """
     Context manager to change working dir, then restore it again.
+
+    Args:
+        folder:
+            Path to folder to change to.
+        verbose:
+            Print directory comman
+
+    Returns:
+        None
     """
     old = Path.cwd()
     if verbose:
@@ -200,9 +223,16 @@ def change_folder(folder, verbose=False):
     os.chdir(old)
 
 
-def columnise(strings):
+def columnise(strings: list[str]) -> str:
     """
-    Return multi-line string containing given strings formatted in columns.
+    Format small strings into columns.
+
+    Args:
+        strings:
+            List of small strings.
+
+    Returns:
+        Multiline string.
     """
     width, _ = shutil.get_terminal_size()
     if not strings:
@@ -221,10 +251,18 @@ def columnise(strings):
     return '\n'.join(lines)
 
 
-def clean(filename):
+def clean(filename: str) -> str:
     """
     Perform best-effort to clean given string into a legal filename.
+
     Preserves case.
+
+    Args:
+        filename:
+            Proposed file name.
+
+    Returns:
+        Cleaned version of input file.
     """
     string = filename.strip()
     # Colon to hyphen
@@ -236,9 +274,36 @@ def clean(filename):
     return string
 
 
-def ffmpeg_extract_audio(path, start, end, output, quality=6, verbose=False):
+def ffmpeg_extract_audio(
+    path: Path,
+    start: float,
+    end: float,
+    output: Path,
+    *,
+    quality: int = 6,
+    verbose: bool = False,
+) -> subprocess.CompletedProcess:
     """
-    Run ``ffmpeg`` to extract audio clip for chapter.
+    Run ``ffmpeg`` to extract audio clip from input.
+
+    Args:
+        path:
+            Path to media file.
+        start:
+            Number of seconds from start of file to start extractions from.
+        end:
+            Seconds from start of file to stop extraction.
+        output:
+            Path to output file to write clip to.
+        quality:
+            Optionally overide MP3 LAME quality setting. The default value is
+            chosen to give small file sizes with acceptable quality for audio
+            books.
+        verbose:
+            Print command-line before running it.
+
+    Returns:
+        Subprocess completed process.
     """
     args = [
         'ffmpeg',
@@ -255,11 +320,35 @@ def ffmpeg_extract_audio(path, start, end, output, quality=6, verbose=False):
         str(output),
     ]
     result = run(args, verbose=verbose)
+    return result
 
 
-def ffprobe_show_chapters(path, verbose=False):
+def ffprobe_show_chapters(path: Path, verbose: bool = False) -> JsonList:
     """
     Run ``ffprobe`` and collect its output.
+
+    Each chapter, if found, has data something like this:
+
+        [...,
+        {
+            'end': 31725609,
+            'end_time': '31725.609000',
+            'id': 19,
+            'start': 29872378,
+            'start_time': '29872.378000',
+            'tags': {'title': '020'},
+            'time_base': '1/1000'
+        },
+        ...]
+
+    Args:
+        path:
+            Path to media file.
+        verbose:
+            Print subprocess command before running it.
+
+    Returns:
+        List of chapter data.
     """
     args = [
         'ffprobe',
@@ -278,7 +367,79 @@ def ffprobe_show_chapters(path, verbose=False):
     return chapters
 
 
-def main(options):
+def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
+    """
+    Run external command and capture its output.
+
+    Thin wrapper around `subprocess.run()`.
+
+    Args:
+        args:
+            Command and its arguments.
+        verbose:
+            Print command before executing it.
+
+    Raises:
+        SystemExit:
+            If command not found, or error running command.
+
+    Returns:
+        Subprocess completed process.
+    """
+    if verbose:
+        Print.command(' '.join([shlex.quote(arg) for arg in args]))
+    try:
+        result = subprocess.run(args, capture_output=True, check=True)
+    except FileNotFoundError:
+        command = args[0]
+        Print.error(f"Command '{command}' not found. Please install.")
+        raise SystemExit(2)
+    except subprocess.CalledProcessError as e:
+        error = e.stderr.decode().strip()
+        message = f"Command error {e.returncode}: {error!r}"
+        Print.error(message)
+        raise SystemExit(1)
+    return result
+
+
+def parse(arguments: list[str]) -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Args:
+        arguments:
+            Argument strings from `sys.argv`.
+
+    Returns:
+        Collected options.
+    """
+    description = "Break audio book into multiple files, one per chapter."
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        '-a', '--add', action='store', metavar='NUM',
+        help='number to add to track index')
+    parser.add_argument(
+        '-v', '--verbose', action='store_true',
+        help="print commands as they are run")
+    parser.add_argument(
+        '-y', '--yes', action='store_false', dest='confirm',
+        help="assume yes; do not ask for confirmation")
+    parser.add_argument('path', metavar='PATH', help='audio file to process')
+    options = parser.parse_args()
+    return options
+
+
+def main(options: argparse.Namespace) -> int:
+    """
+    Command's entry point.
+
+    Args:
+        options:
+            Command-line options parsed by `parse()`.
+
+    Returns:
+        Integer error code.
+    """
     # Examine file
     path = Path(options.path)
     with change_folder(path.parent, verbose=options.verbose):
@@ -297,46 +458,10 @@ def main(options):
         if not response.startswith('y'):
             raise SystemExit(0)
     chapteriser.extract()
-
-
-def parse(arguments):
-    description = "Break audio book into multiple files, one per chapter."
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument(
-        '-a', '--add', action='store', metavar='NUM',
-        help='number to add to track index')
-    parser.add_argument(
-        '-v', '--verbose', action='store_true',
-        help="print commands as they are run")
-    parser.add_argument(
-        '-y', '--yes', action='store_false', dest='confirm',
-        help="assume yes; do not ask for confirmation")
-    parser.add_argument('path', metavar='PATH', help='audio file to process')
-    return parser.parse_args()
-
-
-def run(args, verbose=False):
-    """
-    Run external command and capture its output.
-    """
-    if verbose:
-        Print.command(' '.join([shlex.quote(arg) for arg in args]))
-    try:
-        result = subprocess.run(args, capture_output=True, check=True)
-    except FileNotFoundError:
-        command = args[0]
-        Print.error(f"Command '{command}' not found. Please install.")
-        raise SystemExit(2)
-    except subprocess.CalledProcessError as e:
-        error = e.stderr.decode().strip()
-        message = f"Command error {e.returncode}: {error!r}"
-        Print.error(message)
-        raise SystemExit(1)
-    return result
+    return 0
 
 
 if __name__ == '__main__':
     colorama.init()
     options = parse(sys.argv[1:])
-    main(options)
-    sys.exit(0)
+    sys.exit(main(options))
