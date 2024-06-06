@@ -14,7 +14,6 @@ Requires ffmpeg binaries, the Python package 'rich', and chapter markers
 in the input file.
 
 TODO:
-    * Replace `colorama` for coloured output with `rich`.
     * Refactor with on eye on responsibilities.
 
 """
@@ -32,10 +31,11 @@ import subprocess
 import sys
 from typing import Any, TypeAlias
 
-from rich.console import Console
+from rich import print as rprint
+from rich.columns import Columns
+from rich.prompt import Confirm
 
 
-console = Console()
 JsonList: TypeAlias = list[dict[str, Any]]
 
 
@@ -57,7 +57,7 @@ class Chapteriser:
         # Output folder
         self.folder = self.path.parent / self.make_foldername()
         if self.folder.exists():
-            console.print(f"Output folder already exists: {self.folder}")
+            rprint(f"Output folder already exists: {self.folder}")
             raise SystemExit(1)
         self.folder.mkdir()
 
@@ -65,7 +65,7 @@ class Chapteriser:
         with change_folder(self.folder, verbose=self.verbose):
             for number, chapter in enumerate(self.chapters, 1):
                 filename = self.make_filename(chapter)
-                console.print(f"[{number}/{self.num_chapters}] {filename}")
+                rprint(f"[{number}/{self.num_chapters}] {filename}")
                 self._extract_chapter(filename, chapter)
 
     def _extract_chapter(self, output_path, chapter):
@@ -84,15 +84,21 @@ class Chapteriser:
         last = self.chapters[-1]
         num_seconds = float(last['end_time'])
         total = self.human_time(num_seconds)
-        console.print(f"Found {self.num_chapters:,} chapters within {total} of audio. ")
         average = self.human_time(num_seconds / self.num_chapters)
-        console.print(f"That is an average of {average} per chapter.")
+        rprint(
+            f"[cyan]"
+            f"Found {self.num_chapters:,} chapters within {total} of audio.\n"
+            f"That is an average of {average} per chapter."
+            f"[/cyan]"
+        )
         folder = self.make_foldername()
-        console.print(f"Create folder: '{folder}'")
+        rprint(f"[bright_cyan]Creating folder: '{folder}'")
         lines = []
         for number, chapter in enumerate(self.chapters):
-            lines.append(self.make_filename(chapter))
-        print(columnise(lines))
+            lines.append(repr(self.make_filename(chapter)))
+
+        columns = Columns(lines, equal=True, expand=True)
+        rprint(columns)
 
     def make_filename(self, chapter):
         """
@@ -159,38 +165,10 @@ def change_folder(folder: Path, verbose: bool = False) -> None:
     """
     old = Path.cwd()
     if verbose:
-        console.print(f"cd {folder}")
+        rprint(f"cd {folder}")
     os.chdir(folder)
     yield
     os.chdir(old)
-
-
-def columnise(strings: list[str]) -> str:
-    """
-    Format small strings into columns.
-
-    Args:
-        strings:
-            List of small strings.
-
-    Returns:
-        Multiline string.
-    """
-    width, _ = shutil.get_terminal_size()
-    if not strings:
-        return ''
-    longest = len(max(strings, key=len))
-    max_columns = int(width / (longest + 1))
-    max_columns = max(1, max_columns)
-    num_rows = int(len(strings) / max_columns) + 1
-    padded = ["{0:<{1}}".format(s, longest) for s in strings]
-    lines = []
-    step = num_rows
-    for i in range(num_rows):
-        parts = padded[i::step]
-        line = " ".join(parts)
-        lines.append(line)
-    return '\n'.join(lines)
 
 
 def clean(filename: str) -> str:
@@ -304,7 +282,7 @@ def ffprobe_show_chapters(path: Path, verbose: bool = False) -> JsonList:
     data = json.loads(result.stdout)
     chapters = data.get('chapters', [])
     if not chapters:
-        print('No chapters found in audio file.', file=sys.stderr)
+        rprint('No chapters found in audio file.', file=sys.stderr)
         raise SystemExit(3)
     return chapters
 
@@ -329,17 +307,17 @@ def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
         Subprocess completed process.
     """
     if verbose:
-        console.print(' '.join([shlex.quote(arg) for arg in args]))
+        rprint(' '.join([shlex.quote(arg) for arg in args]))
     try:
         result = subprocess.run(args, capture_output=True, check=True)
     except FileNotFoundError:
         command = args[0]
-        console.print(f"Command '{command}' not found. Please install.")
+        rprint(f"Command '{command}' not found. Please install.")
         raise SystemExit(2)
     except subprocess.CalledProcessError as e:
         error = e.stderr.decode().strip()
         message = f"Command error {e.returncode}: {error!r}"
-        console.print(message)
+        rprint(message)
         raise SystemExit(1)
     return result
 
@@ -395,7 +373,9 @@ def main(options: argparse.Namespace) -> int:
     chapteriser.preview()
 
     if options.confirm:
-        console.print("Do you wish to proceed [y/N]?")
+        is_rich_great = Confirm.ask("Do you like rich?")
+
+        rprint("Do you wish to proceed [y/N]?")
         response = input().lower()
         if not response.startswith('y'):
             raise SystemExit(0)
