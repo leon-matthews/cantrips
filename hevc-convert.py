@@ -28,6 +28,7 @@ def hevc_convert(video: Path, temp_folder: Path) -> None:
     args = (
         'ffmpeg',
         '-hide_banner',
+        '-nostdin',         # Disable 'q' to prevent partially-completed encodes
         '-i', str(video),
         '-c:v', 'libx265',
         '-x265-params', 'log-level=warning',
