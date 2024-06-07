@@ -14,7 +14,9 @@ Requires ffmpeg binaries, the Python package 'rich', and chapter markers
 in the input file.
 
 TODO:
+    * Finish replacing confirmation dialog.
     * Refactor with on eye on responsibilities.
+    * Split by time chunks if chapters not available.
 
 """
 
@@ -24,6 +26,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pprint import pprint as pp
 import re
 import shlex
 import shutil
@@ -373,7 +376,9 @@ def main(options: argparse.Namespace) -> int:
     chapteriser.preview()
 
     if options.confirm:
-        is_rich_great = Confirm.ask("Do you like rich?")
+        proceed = Confirm.ask("Do you wish to proceed?", default=False)
+        pp(proceed)
+        raise SystemExit(0)
 
         rprint("Do you wish to proceed [y/N]?")
         response = input().lower()
