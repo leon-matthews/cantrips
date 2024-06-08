@@ -43,22 +43,20 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Any, TypeAlias, Union
+from typing import Any, Iterator, Union
 
 from rich import print as rprint
 from rich.columns import Columns
 from rich.logging import RichHandler
 from rich.pretty import pprint as pp
 from rich.prompt import Confirm
-from rich.tree import Tree
 
 
-Json: TypeAlias = Union[list, dict[str, Any]]
 logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def change_folder(folder: Path, verbose: bool = False) -> None:
+def change_folder(folder: Path, verbose: bool = False) -> Iterator[None]:
     """
     Context manager to change working dir, then restore it again.
 
@@ -79,7 +77,7 @@ def change_folder(folder: Path, verbose: bool = False) -> None:
     os.chdir(old)
 
 
-def clean(filename: str) -> str:
+def clean_filename(filename: str) -> str:
     """
     Perform best-effort to clean given string into a legal filename.
 
@@ -112,7 +110,7 @@ def ffmpeg_extract_audio(
     *,
     quality: int = 6,
     verbose: bool = False,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """
     Run ``ffmpeg`` to extract audio clip from input.
 
@@ -153,7 +151,7 @@ def ffmpeg_extract_audio(
     return result
 
 
-def ffprobe(path: Path, verbose: bool = False) -> Json:
+def ffprobe(path: Path, verbose: bool = False) -> dict[str, Any]:
     """
     Run system's ``ffprobe`` binary against a media file and collect its output.
 
@@ -212,7 +210,7 @@ def ffprobe(path: Path, verbose: bool = False) -> Json:
     except json.decoder.JSONDecodeError:
         message = f"Could not decode JSON output: {result.stdout!r}"
         logger.error(message)
-        raise RuntimeError(f"Invalid output from ffprobe")
+        raise RuntimeError("Invalid output from ffprobe")
     except RuntimeError as e:
         logger.error("Error running ffprobe: %s", e)
         raise
@@ -220,7 +218,76 @@ def ffprobe(path: Path, verbose: bool = False) -> Json:
     return data
 
 
-def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
+class Seconds:
+    """
+    Attach useful methods to a floating-point quantity of seconds.
+    """
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+
+    def human_duration(self) -> str:
+        """
+        Rough-and-ready formatted duration phrase.
+
+        eg. '1 hour and 15 minutes'
+        """
+        hours, minutes, _ = self.split()
+        hours_part = f"{hours} hour" if hours == 1 else f"{hours} hours"
+        minutes_part = f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+        if hours > 0:
+            return f"{hours_part} and {minutes_part}"
+        else:
+            return f"{minutes_part}"
+
+    def treble(self, truncate:bool = False) -> str:
+        """
+        Build HH:MM:SS style duration string.
+
+        For example::
+
+            >>> Seconds(45_930).treble()
+            '12:45:30.0'
+            >>> Seconds(45_930).treble(truncate=True)
+            '12:45:30'
+
+        Args:
+            truncate:
+                If true, the seconds value is truncated to an integer
+
+        Returns:
+            Formatted string denoting duration.
+        """
+        hours, minutes, seconds = self.split()
+        time = f"{hours:0>2}:{minutes:0>2}:{int(seconds):0>2}"
+        if not truncate:
+            time += str(seconds - int(seconds))[1:]
+        return time
+
+    def split(self) -> tuple[int, int, float]:
+        """
+        Break seconds into hours, minutes, and remaining seconds.
+        """
+        hours, seconds = divmod(self.seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        return int(hours), int(minutes), float(seconds)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.seconds})"
+
+    def __str__(self) -> str:
+        return self.human_duration()
+
+    def __truediv__(self, other: float|Seconds) -> Seconds:
+        if isinstance(other, (float, int)):
+            return Seconds(self.seconds / other)
+        elif isinstance(other, Seconds):
+            return Seconds(self.seconds / other.seconds)
+        else:
+            return NotImplemented
+
+
+def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess[str]:
     """
     Run external command and capture its output.
 
@@ -244,7 +311,7 @@ def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
     if verbose:
         rprint(' '.join([shlex.quote(arg) for arg in args]))
     try:
-        result = subprocess.run(args, capture_output=True, check=True)
+        result = subprocess.run(args, capture_output=True, check=True, text=True)
     except FileNotFoundError:
         command = args[0]
         rprint(f"Command '{command}' not found on system. Please install.")
@@ -299,6 +366,7 @@ class Chapteriser:
         """
         self.path = path
         self.mediainfo = MediaInfo(self.path)
+        self.duration = self.mediainfo.get_duration()
 
     def chapterise(self) -> list[Chapter]:
         """
@@ -307,8 +375,7 @@ class Chapteriser:
         Returns:
             List of chapter instances.
         """
-        # Metadata
-        pp(self.mediainfo.get_duration())
+        # From metadata?
         chapters = self.mediainfo.get_chapters()
 
         # Fallback to fixed-sized parts
@@ -317,6 +384,12 @@ class Chapteriser:
 
         return chapters
 
+    def get_duration(self) -> float:
+        """
+        Total length of audiobook, in seconds.
+        """
+        return self.duration
+
     def make_parts(self) -> list[Chapter]:
         """
         Create evenly sized parts in the absence of better data.
@@ -324,12 +397,11 @@ class Chapteriser:
         Returns:
             List of chapter instances.
         """
-        duration = self.mediainfo.get_duration()
-        num_parts = round((duration / 60) / self.target_minutes)
-        seconds = duration / num_parts
+        num_parts = round((self.duration / 60) / self.target_minutes)
+        seconds = self.duration / num_parts
 
         chapters = []
-        start = 0
+        start = 0.0
         end = seconds
         for index in range(1, (num_parts + 1)):
             chapters.append(Chapter(start, end, f"Part {index}"))
@@ -442,77 +514,6 @@ class Splitinator:
         input_path = f"../{self.path.name}"
         ffmpeg_extract_audio(input_path, start, end, output_path, verbose=self.verbose)
 
-    def preview(self):
-        """
-        Print multi-column string show preview of output folder.
-        """
-        last = self.chapters[-1]
-        num_seconds = float(last['end_time'])
-        total = self.human_time(num_seconds)
-        average = self.human_time(num_seconds / self.num_chapters)
-        rprint(
-            f"[cyan]"
-            f"Found {self.num_chapters:,} chapters within {total} of audio.\n"
-            f"That is an average of {average} per chapter."
-            f"[/cyan]"
-        )
-        folder = self.make_foldername()
-        rprint(f"[bright_cyan]Creating folder: '{folder}'")
-        lines = []
-        for number, chapter in enumerate(self.chapters):
-            lines.append(repr(self.make_filename(chapter)))
-
-        columns = Columns(lines, equal=True, expand=True)
-        rprint(columns)
-
-    def make_filename(self, chapter):
-        """
-        Build the output file name for given (zero-based) index.
-        """
-        index = chapter['id'] + self.add_index
-        # Replace empty or numeric only titles
-        title = chapter.get('tags', {}).get('title', '')
-        stripped = title.strip('1234567890')
-        if not stripped:
-            title = f"Chapter {index+1}"
-        prefix = f"{index+1:0>{self.padding}}"
-        filename = f"{prefix}. {title}{self.extension}"
-        filename = clean(filename)
-        return filename
-
-    def make_foldername(self):
-        folder = clean(self.path.stem)
-        return folder
-
-    def human_time(self, seconds: int) -> str:
-        """
-        Human friendly formatted duration.
-
-        eg. '1 hour and 15 minutes'
-        """
-        hours, minutes, _ = self._time(seconds)
-        hours_part = f"{hours} hour" if hours == 1 else f"{hours} hours"
-        minutes_part = f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
-        if hours > 0:
-            return f"{hours_part} and {minutes_part}"
-        else:
-            return f"{minutes_part}"
-
-    def short_time(self, seconds: int, truncate=False) -> str:
-        """
-        eg. '00:45'
-        """
-        hours, minutes, seconds = self._time(seconds)
-        time = f"{hours:0>2}:{minutes:0>2}:{int(seconds):0>2}"
-        if not truncate:
-            time += str(seconds - int(seconds))[1:]
-        return time
-
-    def _time(self, seconds: int):
-        hours, seconds = divmod(seconds, 3600)
-        minutes, seconds = divmod(seconds, 60)
-        return int(hours), int(minutes), float(seconds)
-
     def make_filename(
         self,
         index: int,
@@ -528,6 +529,7 @@ class Splitinator:
                 Index of
         """
         name = f"{index:0>{padding}}. {chapter.title}.{suffix}"
+        name = clean_filename(name)
         return name
 
     def make_filenames(self) -> list[str]:
@@ -539,8 +541,9 @@ class Splitinator:
         return filenames
 
     def make_foldername(self) -> str:
-        folder = clean(self.path.stem)
+        folder = clean_filename(self.path.stem)
         return folder
+
 
 def parse(arguments: list[str]) -> argparse.Namespace:
     """
@@ -584,48 +587,39 @@ def main(options: argparse.Namespace) -> int:
     path = Path(options.path)
     chapteriser = Chapteriser(path)
     splitinator = Splitinator(chapteriser)
-    rprint(f":file_folder: [bright_yellow bold]{splitinator.make_foldername()}")
-    filenames = [f"[yellow]{name}" for name in splitinator.make_filenames()]
+
+    # Preview, then confirm
+    rprint(f":file_folder: {splitinator.make_foldername()}/")
+    filenames = splitinator.make_filenames()
     columns = Columns(filenames, equal=True, expand=True)
     rprint(columns)
 
-    if options.confirm:
-        proceed = Confirm.ask("Do you wish to proceed?", default=False)
-
-    pp(proceed)
-
-
-    raise SystemExit(0)
-
-    with change_folder(path.parent, verbose=options.verbose):
-        chapters = ffprobe_data(path.name, verbose=options.verbose)
-
-    # Check with user
-    add_index = 0
-    if options.add:
-        add_index = int(options.add)
-    chapteriser = Chapteriser(path, chapters, add_index=add_index, verbose=options.verbose)
-    chapteriser.preview()
-
-    raise SystemExit(0)
+    total = Seconds(chapteriser.get_duration())
+    average = total / len(filenames)
+    rprint()
+    rprint(
+        f"Creating {len(filenames)} files averaging {average} each, "
+        f"totalling {total} of audio."
+    )
 
     if options.confirm:
         proceed = Confirm.ask("Do you wish to proceed?", default=False)
-        pp(proceed)
+    else:
+        proceed = True
+
+    if not proceed:
         raise SystemExit(0)
 
-        rprint("Do you wish to proceed [y/N]?")
-        response = input().lower()
-        if not response.startswith('y'):
-            raise SystemExit(0)
-    chapteriser.extract()
-    return 0
+    rprint("DENNO")
+    sys.exit(1)
 
 
 if __name__ == '__main__':
-    FORMAT = "%(message)s"
     logging.basicConfig(
-        level="NOTSET", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(show_path=False, show_time=False)]
     )
     options = parse(sys.argv[1:])
     sys.exit(main(options))
