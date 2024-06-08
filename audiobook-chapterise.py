@@ -3,15 +3,26 @@
 """
 Break a single-file audio book into separate MP3 files.
 
-I like to use listen to audiobooks while I work on DIY projects. I use cheap
-little MP3 players because phones are too expensive to replace when they get
-paint on them or get water-blasted.
+I like to use listen to audiobooks while I work on DIY projects. Smart phones
+are too expensive to replace when they get paint on them or get accidentally
+power-washed, so I use cheap little MP3 players instead.
 
 The original file is left untouched. Output files are written into a new
-directory in the same folder as the original file.
+directory in the same folder as the original file. The goal is to be able to
+produce a folder full of audio files, one-per-chapter. Something like::
 
-Requires ffmpeg binaries, the Python package 'rich', and chapter markers
-in the input file.
+    My Book/
+        01. Chapter 1.mp3
+        02. Chapter 2.mp3
+        03. Chapter 3.mp3
+        ...
+
+
+
+Requirements:
+    Requires the `ffmpeg` and `ffprobe` binaries, and the Python package 'rich'.
+    https://ffmpeg.org/
+    https://rich.readthedocs.io/en/latest/
 
 TODO:
     * Finish replacing confirmation dialog.
@@ -20,29 +31,226 @@ TODO:
 
 """
 
+from __future__ import annotations
+
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import math
 import os
+import logging
 from pathlib import Path
 from pprint import pprint as pp
 import re
 import shlex
-import shutil
 import subprocess
 import sys
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, Union
 
 from rich import print as rprint
 from rich.columns import Columns
 from rich.prompt import Confirm
 
 
-JsonList: TypeAlias = list[dict[str, Any]]
+Json: TypeAlias = Union[list, dict[str, Any]]
+logger = logging.getLogger(__name__)
 
 
-class Chapteriser:
+@contextmanager
+def change_folder(folder: Path, verbose: bool = False) -> None:
+    """
+    Context manager to change working dir, then restore it again.
+
+    Args:
+        folder:
+            Path to folder to change to.
+        verbose:
+            Print directory comman
+
+    Returns:
+        None
+    """
+    old = Path.cwd()
+    if verbose:
+        rprint(f"cd {folder}")
+    os.chdir(folder)
+    yield
+    os.chdir(old)
+
+
+def clean(filename: str) -> str:
+    """
+    Perform best-effort to clean given string into a legal filename.
+
+    Preserves case.
+
+    Args:
+        filename:
+            Proposed file name.
+
+    Returns:
+        Cleaned version of input file.
+    """
+    # Colon to hyphen
+    string = filename.strip()
+    string = string.replace(':', ' - ')
+
+    # Replace illegal characters
+    string = re.sub(r'[^\w\' .,\(\)]', ' ', string)
+
+    # Compact runs of whitespace
+    string = re.sub(r'\s+', ' ', string)
+    return string
+
+
+def ffmpeg_extract_audio(
+    path: Path,
+    start: float,
+    end: float,
+    output: Path,
+    *,
+    quality: int = 6,
+    verbose: bool = False,
+) -> subprocess.CompletedProcess:
+    """
+    Run ``ffmpeg`` to extract audio clip from input.
+
+    Args:
+        path:
+            Path to media file.
+        start:
+            Number of seconds from start of file to start extractions from.
+        end:
+            Seconds from start of file to stop extraction.
+        output:
+            Path to output file to write clip to.
+        quality:
+            Optionally overide MP3 LAME quality setting. The default value is
+            chosen to give small file sizes with acceptable quality for audio
+            books.
+        verbose:
+            Print command-line before running it.
+
+    Returns:
+        Subprocess completed process.
+    """
+    args = [
+        'ffmpeg',
+        '-i', str(path),
+        '-hide_banner',
+        '-vn', '-sn', '-dn',    # Drop video, subtitle and data streams
+        '-ss', str(start),
+        '-to', str(end),
+        '-codec:a',
+        'libmp3lame',
+        '-ac', '2',
+        '-qscale:a', str(quality),
+        '-n',                   # Don't overwrite existing
+        str(output),
+    ]
+    result = run(args, verbose=verbose)
+    return result
+
+
+def ffprobe(path: Path, verbose: bool = False) -> Json:
+    """
+    Run system's ``ffprobe`` binary against a media file and collect its output.
+
+    Currently, we're capturing chapter and general format info, from a JSON
+    packet that looks something like this::
+
+        {
+            'chapters': [
+                ...,
+                {
+                    'end': 31725609,
+                    'end_time': '31725.609000',
+                    'id': 19,
+                    'start': 29872378,
+                    'start_time': '29872.378000',
+                    'tags': {'title': '020'},
+                    'time_base': '1/1000'
+                },
+                ...,
+            ],
+            'format': {
+                'bit_rate': '63498',
+                'duration': '29688.662494',
+                ...,
+            }
+        }
+
+    Args:
+        path:
+            Path to media file.
+        verbose:
+            Print subprocess command before running it.
+
+    Returns:
+        List of chapter data.
+    """
+    args = [
+        'ffprobe',
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-i', str(path),
+        '-print_format',
+        'json',
+        '-show_chapters',
+        '-show_format',
+    ]
+
+    data = {}
+    try:
+        result = run(args, verbose=verbose)
+        data = json.loads(result.stdout)
+    except json.decoder.JSONDecodeError:
+        rprint('json error')
+    except RuntimeError as e:
+        rprint(e)
+
+    return data
+
+
+def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
+    """
+    Run external command and capture its output.
+
+    Thin wrapper around `subprocess.run()`.
+
+    Args:
+        args:
+            Command and its arguments.
+        verbose:
+            Print command before executing it.
+
+    Raises:
+        RuntimeError:
+            If command exits with non-zero exit code.
+        SystemExit:
+            If command not found exits program with exit code 100.
+
+    Returns:
+        Object holding data about completed process, including stdout.
+    """
+    if verbose:
+        rprint(' '.join([shlex.quote(arg) for arg in args]))
+    try:
+        result = subprocess.run(args, capture_output=True, check=True)
+    except FileNotFoundError:
+        command = args[0]
+        rprint(f"Command '{command}' not found on system. Please install.")
+        raise SystemExit(100)
+    except subprocess.CalledProcessError as e:
+        error = e.stderr.decode().strip()
+        message = f"Command returned error code {e.returncode}: {error!r}"
+        rprint(message)
+        raise RuntimeError(message) from None
+    return result
+
+
+class ChapteriserOld:
     """
     Break large single-file audio books into small MP3 files.
     """
@@ -151,178 +359,148 @@ class Chapteriser:
         minutes, seconds = divmod(seconds, 60)
         return int(hours), int(minutes), float(seconds)
 
+    def make_filename(
+        self,
+        chapter: Chapter,
+        index: int,
+        padding: int = 2,
+        suffix: str = 'mp3',
+    ) -> str:
+        """
+        Build filename
 
-@contextmanager
-def change_folder(folder: Path, verbose: bool = False) -> None:
+        Args:
+            index:
+                Index of
+        """
+        return f"{index:0>{padding}}. {chapter.title}.{suffix}"
+
+
+@dataclass
+class Chapter:
     """
-    Context manager to change working dir, then restore it again.
-
-    Args:
-        folder:
-            Path to folder to change to.
-        verbose:
-            Print directory comman
-
-    Returns:
-        None
+    Basic metadata on audiobook clips.
     """
-    old = Path.cwd()
-    if verbose:
-        rprint(f"cd {folder}")
-    os.chdir(folder)
-    yield
-    os.chdir(old)
+    start: float
+    end: float
+    title: str
 
 
-def clean(filename: str) -> str:
+class Chapteriser:
     """
-    Perform best-effort to clean given string into a legal filename.
+    Plan out the chapters that audiobook should be broken up into.
 
-    Preserves case.
+    The output of this class is only a list of `Chapter` objects which are
+    either extracted from the original file's metadata, or built-up manually.
 
-    Args:
-        filename:
-            Proposed file name.
+        >>> chapteriser = Chapteriser(path_to_media)
+        >>> chapteriser.chapterise()
+        [Chapter(start=0, end=1190.5872723555556, title='Part 1'),
+         Chapter(start=1190.5872723555556, end=2381.174544711111, title='Part 2'),
+         ...
+         Chapter(start=51195.25271128892, end=52385.83998364448, title='Part 44'),
+         Chapter(start=52385.83998364448, end=53576.42725600004, title='Part 45')]
 
-    Returns:
-        Cleaned version of input file.
+    Attrs:
+        target_minutes:
+            If manually creating parts, aim for this many minutes long.
     """
-    string = filename.strip()
-    # Colon to hyphen
-    string = string.replace(':', ' - ')
-    # Replace illegal characters
-    string = re.sub(r'[^\w\' .,\(\)]', ' ', string)
-    # Compact runs of whitespace
-    string = re.sub(r'\s+', ' ', string)
-    return string
+
+    target_minutes: int = 20
+
+    def __init__(self, path: Path):
+        """
+        Initialiser.
+
+        Args:
+            path:
+                Path to media file.
+        """
+        self.path = path
+        self.mediainfo = MediaInfo(self.path)
+
+    def chapterise(self) -> list[Chapter]:
+        """
+        Create chapters.
+
+        Returns:
+            List of chapter instances.
+        """
+        # Metadata
+        pp(self.mediainfo.get_duration())
+        chapters = self.mediainfo.get_chapters()
+
+        # Fallback to fixed-sized parts
+        if not chapters:
+            chapters = self.make_parts()
+
+        return chapters
+
+    def make_parts(self) -> list[Chapter]:
+        """
+        Create evenly sized parts in the absence of better data.
+
+        Returns:
+            List of chapter instances.
+        """
+        duration = self.mediainfo.get_duration()
+        num_parts = round((duration / 60) / self.target_minutes)
+        seconds = duration / num_parts
+
+        chapters = []
+        start = 0
+        end = seconds
+        for index in range(1, (num_parts + 1)):
+            chapters.append(Chapter(start, end, f"Part {index}"))
+            start = end
+            end += seconds
+
+        return chapters
 
 
-def ffmpeg_extract_audio(
-    path: Path,
-    start: float,
-    end: float,
-    output: Path,
-    *,
-    quality: int = 6,
-    verbose: bool = False,
-) -> subprocess.CompletedProcess:
+class MediaInfo:
     """
-    Run ``ffmpeg`` to extract audio clip from input.
-
-    Args:
-        path:
-            Path to media file.
-        start:
-            Number of seconds from start of file to start extractions from.
-        end:
-            Seconds from start of file to stop extraction.
-        output:
-            Path to output file to write clip to.
-        quality:
-            Optionally overide MP3 LAME quality setting. The default value is
-            chosen to give small file sizes with acceptable quality for audio
-            books.
-        verbose:
-            Print command-line before running it.
-
-    Returns:
-        Subprocess completed process.
+    Basic info about media file, powered by `ffprobe` binary.
     """
-    args = [
-        'ffmpeg',
-        '-i', str(path),
-        '-hide_banner',
-        '-vn', '-sn', '-dn',    # Drop video, subtitle and data streams
-        '-ss', str(start),
-        '-to', str(end),
-        '-codec:a',
-        'libmp3lame',
-        '-ac', '2',
-        '-qscale:a', str(quality),
-        '-n',                   # Don't overwrite existing
-        str(output),
-    ]
-    result = run(args, verbose=verbose)
-    return result
+    def __init__(self, path: Path):
+        """
+        Initialiser.
 
+        Run's `ffprobe` against given path and collects its output.
+        """
+        self.path = path
+        self.data = ffprobe(self.path)
 
-def ffprobe_show_chapters(path: Path, verbose: bool = False) -> JsonList:
-    """
-    Run ``ffprobe`` and collect its output.
+    def get_duration(self) -> float:
+        """
+        Total duration of mediafile, in seconds.
+        """
+        duration = float(self.data['format']['duration'])
+        return duration
 
-    Each chapter, if found, has data something like this:
+    def get_chapters(self) -> list[Chapter]:
+        """
+        Extract chapter metadata directly from media file.
 
-        [...,
-        {
-            'end': 31725609,
-            'end_time': '31725.609000',
-            'id': 19,
-            'start': 29872378,
-            'start_time': '29872.378000',
-            'tags': {'title': '020'},
-            'time_base': '1/1000'
-        },
-        ...]
+        Audiobooks are often supplied in M4A or M4B formats which is a single
+        file, but contain bookmarks for each chapter.
 
-    Args:
-        path:
-            Path to media file.
-        verbose:
-            Print subprocess command before running it.
+        Returns:
+            Possibly empty list of Chapter objects.
+        """
+        data = self.data.get('chapters', [])
+        if not data:
+            logger.error('No chapters found in audio file: %s', self.path)
+            return []
 
-    Returns:
-        List of chapter data.
-    """
-    args = [
-        'ffprobe',
-        '-i', str(path),
-        '-hide_banner',
-        '-print_format',
-        'json',
-        '-show_chapters',
-    ]
-    result = run(args, verbose=verbose)
-    data = json.loads(result.stdout)
-    chapters = data.get('chapters', [])
-    if not chapters:
-        rprint('No chapters found in audio file.', file=sys.stderr)
-        raise SystemExit(3)
-    return chapters
+        chapters = []
+        for datum in data:
+            start = float(datum['start_time'])
+            end = float(datum['end_time'])
+            title = datum.get('tags', {}).get('title', '')
+            chapters.append(Chapter(start, end, title))
 
-
-def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
-    """
-    Run external command and capture its output.
-
-    Thin wrapper around `subprocess.run()`.
-
-    Args:
-        args:
-            Command and its arguments.
-        verbose:
-            Print command before executing it.
-
-    Raises:
-        SystemExit:
-            If command not found, or error running command.
-
-    Returns:
-        Subprocess completed process.
-    """
-    if verbose:
-        rprint(' '.join([shlex.quote(arg) for arg in args]))
-    try:
-        result = subprocess.run(args, capture_output=True, check=True)
-    except FileNotFoundError:
-        command = args[0]
-        rprint(f"Command '{command}' not found. Please install.")
-        raise SystemExit(2)
-    except subprocess.CalledProcessError as e:
-        error = e.stderr.decode().strip()
-        message = f"Command error {e.returncode}: {error!r}"
-        rprint(message)
-        raise SystemExit(1)
-    return result
+        return chapters
 
 
 def parse(arguments: list[str]) -> argparse.Namespace:
@@ -365,8 +543,13 @@ def main(options: argparse.Namespace) -> int:
     """
     # Examine file
     path = Path(options.path)
+    chapteriser = Chapteriser(path)
+    pp(chapteriser.chapterise())
+
+
+    raise SystemExit(0)
     with change_folder(path.parent, verbose=options.verbose):
-        chapters = ffprobe_show_chapters(path.name, verbose=options.verbose)
+        chapters = ffprobe_data(path.name, verbose=options.verbose)
 
     # Check with user
     add_index = 0
@@ -374,6 +557,8 @@ def main(options: argparse.Namespace) -> int:
         add_index = int(options.add)
     chapteriser = Chapteriser(path, chapters, add_index=add_index, verbose=options.verbose)
     chapteriser.preview()
+
+    raise SystemExit(0)
 
     if options.confirm:
         proceed = Confirm.ask("Do you wish to proceed?", default=False)
