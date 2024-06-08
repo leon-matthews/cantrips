@@ -314,12 +314,12 @@ def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess[s
         result = subprocess.run(args, capture_output=True, check=True, text=True)
     except FileNotFoundError:
         command = args[0]
-        rprint(f"Command '{command}' not found on system. Please install.")
+        logger.error(f"Command '{command}' not found on system. Please install.")
         raise SystemExit(100)
     except subprocess.CalledProcessError as e:
-        error = e.stderr.decode().strip()
+        error = e.stderr.strip()
         message = f"Command returned error code {e.returncode}: {error!r}"
-        rprint(message)
+        logger.error(message)
         raise RuntimeError(message) from None
     return result
 
@@ -443,7 +443,7 @@ class MediaInfo:
         """
         data = self.data.get('chapters', [])
         if not data:
-            logger.warning('No chapters found in audio file: %s', self.path)
+            logger.warning("No chapters found in audio file: %r", self.path.name)
             return []
 
         chapters = []
@@ -584,11 +584,33 @@ def main(options: argparse.Namespace) -> int:
         Integer error code.
     """
     # Examine file
-    path = Path(options.path)
-    chapteriser = Chapteriser(path)
-    splitinator = Splitinator(chapteriser)
+    try:
+        path = Path(options.path).resolve()
+        chapteriser = Chapteriser(path)
+        splitinator = Splitinator(chapteriser)
+    except RuntimeError as e:
+        rprint(e)
+        sys.exit(1)
 
     # Preview, then confirm
+    if options.confirm:
+        preview(chapteriser, splitinator)
+
+    # Create folder, create split files
+    rprint("DENNO")
+    sys.exit(1)
+
+
+def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
+    """
+    Preview, then ask user for permission to continue.
+
+    Nothing is returned, no side effects except for a possible system exit.
+
+    Raises:
+        SystemExit:
+            If user chose not to continue.
+    """
     rprint(f":file_folder: {splitinator.make_foldername()}/")
     filenames = splitinator.make_filenames()
     columns = Columns(filenames, equal=True, expand=True)
@@ -602,16 +624,9 @@ def main(options: argparse.Namespace) -> int:
         f"totalling {total} of audio."
     )
 
-    if options.confirm:
-        proceed = Confirm.ask("Do you wish to proceed?", default=False)
-    else:
-        proceed = True
-
+    proceed = Confirm.ask("Do you wish to proceed?", default=False)
     if not proceed:
         raise SystemExit(0)
-
-    rprint("DENNO")
-    sys.exit(1)
 
 
 if __name__ == '__main__':
