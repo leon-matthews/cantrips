@@ -558,12 +558,12 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     """
     description = "Break audio book into multiple files, one per chapter."
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument(
-        '-a', '--add', action='store', metavar='NUM',
-        help='number to add to track index')
-    parser.add_argument(
-        '-v', '--verbose', action='store_true',
-        help="print commands as they are run")
+    # ~ parser.add_argument(
+        # ~ '-a', '--add', action='store', metavar='NUM',
+        # ~ help='number to add to track index')
+    # ~ parser.add_argument(
+        # ~ '-v', '--verbose', action='store_true',
+        # ~ help="print commands as they are run")
     parser.add_argument(
         '-y', '--yes', action='store_false', dest='confirm',
         help="assume yes; do not ask for confirmation")
