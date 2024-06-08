@@ -17,8 +17,6 @@ produce a folder full of audio files, one-per-chapter. Something like::
         03. Chapter 3.mp3
         ...
 
-
-
 Requirements:
     Requires the `ffmpeg` and `ffprobe` binaries, and the Python package 'rich'.
     https://ffmpeg.org/
@@ -41,7 +39,6 @@ import math
 import os
 import logging
 from pathlib import Path
-from pprint import pprint as pp
 import re
 import shlex
 import subprocess
@@ -50,7 +47,10 @@ from typing import Any, TypeAlias, Union
 
 from rich import print as rprint
 from rich.columns import Columns
+from rich.logging import RichHandler
+from rich.pretty import pprint as pp
 from rich.prompt import Confirm
+from rich.tree import Tree
 
 
 Json: TypeAlias = Union[list, dict[str, Any]]
@@ -187,6 +187,10 @@ def ffprobe(path: Path, verbose: bool = False) -> Json:
         verbose:
             Print subprocess command before running it.
 
+    Raises:
+        RuntimeError:
+            If something goes wrong running command.
+
     Returns:
         List of chapter data.
     """
@@ -206,9 +210,12 @@ def ffprobe(path: Path, verbose: bool = False) -> Json:
         result = run(args, verbose=verbose)
         data = json.loads(result.stdout)
     except json.decoder.JSONDecodeError:
-        rprint('json error')
+        message = f"Could not decode JSON output: {result.stdout!r}"
+        logger.error(message)
+        raise RuntimeError(f"Invalid output from ffprobe")
     except RuntimeError as e:
-        rprint(e)
+        logger.error("Error running ffprobe: %s", e)
+        raise
 
     return data
 
@@ -248,132 +255,6 @@ def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
         rprint(message)
         raise RuntimeError(message) from None
     return result
-
-
-class ChapteriserOld:
-    """
-    Break large single-file audio books into small MP3 files.
-    """
-    def __init__(self, path, chapters, add_index=0, verbose=False):
-        self.path = path
-        self.add_index = add_index
-        self.extension = '.mp3'
-        self.chapters = chapters
-        self.folder = None
-        self.num_chapters = len(chapters)
-        self.padding = max(2, math.ceil(math.log(self.num_chapters + add_index + 1, 10)))
-        self.verbose = verbose
-
-    def extract(self):
-        # Output folder
-        self.folder = self.path.parent / self.make_foldername()
-        if self.folder.exists():
-            rprint(f"Output folder already exists: {self.folder}")
-            raise SystemExit(1)
-        self.folder.mkdir()
-
-        # Output files
-        with change_folder(self.folder, verbose=self.verbose):
-            for number, chapter in enumerate(self.chapters, 1):
-                filename = self.make_filename(chapter)
-                rprint(f"[{number}/{self.num_chapters}] {filename}")
-                self._extract_chapter(filename, chapter)
-
-    def _extract_chapter(self, output_path, chapter):
-        """
-        Extract a single chapter.
-        """
-        start = float(chapter['start_time'])
-        end = float(chapter['end_time'])
-        input_path = f"../{self.path.name}"
-        ffmpeg_extract_audio(input_path, start, end, output_path, verbose=self.verbose)
-
-    def preview(self):
-        """
-        Print multi-column string show preview of output folder.
-        """
-        last = self.chapters[-1]
-        num_seconds = float(last['end_time'])
-        total = self.human_time(num_seconds)
-        average = self.human_time(num_seconds / self.num_chapters)
-        rprint(
-            f"[cyan]"
-            f"Found {self.num_chapters:,} chapters within {total} of audio.\n"
-            f"That is an average of {average} per chapter."
-            f"[/cyan]"
-        )
-        folder = self.make_foldername()
-        rprint(f"[bright_cyan]Creating folder: '{folder}'")
-        lines = []
-        for number, chapter in enumerate(self.chapters):
-            lines.append(repr(self.make_filename(chapter)))
-
-        columns = Columns(lines, equal=True, expand=True)
-        rprint(columns)
-
-    def make_filename(self, chapter):
-        """
-        Build the output file name for given (zero-based) index.
-        """
-        index = chapter['id'] + self.add_index
-        # Replace empty or numeric only titles
-        title = chapter.get('tags', {}).get('title', '')
-        stripped = title.strip('1234567890')
-        if not stripped:
-            title = f"Chapter {index+1}"
-        prefix = f"{index+1:0>{self.padding}}"
-        filename = f"{prefix}. {title}{self.extension}"
-        filename = clean(filename)
-        return filename
-
-    def make_foldername(self):
-        folder = clean(self.path.stem)
-        return folder
-
-    def human_time(self, seconds: int) -> str:
-        """
-        Human friendly formatted duration.
-
-        eg. '1 hour and 15 minutes'
-        """
-        hours, minutes, _ = self._time(seconds)
-        hours_part = f"{hours} hour" if hours == 1 else f"{hours} hours"
-        minutes_part = f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
-        if hours > 0:
-            return f"{hours_part} and {minutes_part}"
-        else:
-            return f"{minutes_part}"
-
-    def short_time(self, seconds: int, truncate=False) -> str:
-        """
-        eg. '00:45'
-        """
-        hours, minutes, seconds = self._time(seconds)
-        time = f"{hours:0>2}:{minutes:0>2}:{int(seconds):0>2}"
-        if not truncate:
-            time += str(seconds - int(seconds))[1:]
-        return time
-
-    def _time(self, seconds: int):
-        hours, seconds = divmod(seconds, 3600)
-        minutes, seconds = divmod(seconds, 60)
-        return int(hours), int(minutes), float(seconds)
-
-    def make_filename(
-        self,
-        chapter: Chapter,
-        index: int,
-        padding: int = 2,
-        suffix: str = 'mp3',
-    ) -> str:
-        """
-        Build filename
-
-        Args:
-            index:
-                Index of
-        """
-        return f"{index:0>{padding}}. {chapter.title}.{suffix}"
 
 
 @dataclass
@@ -490,7 +371,7 @@ class MediaInfo:
         """
         data = self.data.get('chapters', [])
         if not data:
-            logger.error('No chapters found in audio file: %s', self.path)
+            logger.warning('No chapters found in audio file: %s', self.path)
             return []
 
         chapters = []
@@ -502,6 +383,164 @@ class MediaInfo:
 
         return chapters
 
+
+class Splitinator:
+    """
+    Split single-file audiobook into seperate files.
+    """
+    def __init__(self, chapteriser: Chapteriser):
+        """
+        Initialiser.
+
+        Args:
+            chapteriser:
+                Valid Chapteriser instance.
+        """
+        self.chapters = chapteriser.chapterise()
+        self.path = chapteriser.path
+
+    def calculate_padding(self, max_value: int) -> int:
+        """
+        Calculate the width of padding required for file names.
+
+            >>> padding_digits(33)
+            2
+            >>> padding_digits(1000)
+            4
+
+        Args:
+            max_value:
+                Highest number required.
+
+        Return:
+            Number of padding digits required.
+        """
+        padding = max(2, math.ceil(math.log(max_value + 1, 10)))
+        return padding
+
+    def extract(self):
+        # Output folder
+        self.folder = self.path.parent / self.make_foldername()
+        if self.folder.exists():
+            logger.critical(f"Output folder already exists: {self.folder}")
+            raise SystemExit(1)
+        self.folder.mkdir()
+
+        # Output files
+        with change_folder(self.folder, verbose=self.verbose):
+            for number, chapter in enumerate(self.chapters, 1):
+                filename = self.make_filename(chapter)
+                rprint(f"[{number}/{self.num_chapters}] {filename}")
+                self._extract_chapter(filename, chapter)
+
+    def _extract_chapter(self, output_path, chapter):
+        """
+        Extract a single chapter.
+        """
+        start = float(chapter['start_time'])
+        end = float(chapter['end_time'])
+        input_path = f"../{self.path.name}"
+        ffmpeg_extract_audio(input_path, start, end, output_path, verbose=self.verbose)
+
+    def preview(self):
+        """
+        Print multi-column string show preview of output folder.
+        """
+        last = self.chapters[-1]
+        num_seconds = float(last['end_time'])
+        total = self.human_time(num_seconds)
+        average = self.human_time(num_seconds / self.num_chapters)
+        rprint(
+            f"[cyan]"
+            f"Found {self.num_chapters:,} chapters within {total} of audio.\n"
+            f"That is an average of {average} per chapter."
+            f"[/cyan]"
+        )
+        folder = self.make_foldername()
+        rprint(f"[bright_cyan]Creating folder: '{folder}'")
+        lines = []
+        for number, chapter in enumerate(self.chapters):
+            lines.append(repr(self.make_filename(chapter)))
+
+        columns = Columns(lines, equal=True, expand=True)
+        rprint(columns)
+
+    def make_filename(self, chapter):
+        """
+        Build the output file name for given (zero-based) index.
+        """
+        index = chapter['id'] + self.add_index
+        # Replace empty or numeric only titles
+        title = chapter.get('tags', {}).get('title', '')
+        stripped = title.strip('1234567890')
+        if not stripped:
+            title = f"Chapter {index+1}"
+        prefix = f"{index+1:0>{self.padding}}"
+        filename = f"{prefix}. {title}{self.extension}"
+        filename = clean(filename)
+        return filename
+
+    def make_foldername(self):
+        folder = clean(self.path.stem)
+        return folder
+
+    def human_time(self, seconds: int) -> str:
+        """
+        Human friendly formatted duration.
+
+        eg. '1 hour and 15 minutes'
+        """
+        hours, minutes, _ = self._time(seconds)
+        hours_part = f"{hours} hour" if hours == 1 else f"{hours} hours"
+        minutes_part = f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+        if hours > 0:
+            return f"{hours_part} and {minutes_part}"
+        else:
+            return f"{minutes_part}"
+
+    def short_time(self, seconds: int, truncate=False) -> str:
+        """
+        eg. '00:45'
+        """
+        hours, minutes, seconds = self._time(seconds)
+        time = f"{hours:0>2}:{minutes:0>2}:{int(seconds):0>2}"
+        if not truncate:
+            time += str(seconds - int(seconds))[1:]
+        return time
+
+    def _time(self, seconds: int):
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        return int(hours), int(minutes), float(seconds)
+
+    def make_filename(
+        self,
+        index: int,
+        chapter: Chapter,
+        padding: int = 2,
+        suffix: str = 'mp3',
+    ) -> str:
+        """
+        Build filename
+
+        Args:
+            index:
+                Index of
+        """
+        name = f"{index:0>{padding}}. {chapter.title}.{suffix}"
+        return name
+
+    def make_filenames(self) -> list[str]:
+        filenames = []
+        padding = self.calculate_padding(len(self.chapters))
+        for index, chapter in enumerate(self.chapters, 1):
+            name = self.make_filename(index, chapter, padding)
+            filenames.append(name)
+        return filenames
+
+    def make_foldername(self) -> str:
+        folder = clean(self.path.stem)
+        return folder
 
 def parse(arguments: list[str]) -> argparse.Namespace:
     """
@@ -544,10 +583,20 @@ def main(options: argparse.Namespace) -> int:
     # Examine file
     path = Path(options.path)
     chapteriser = Chapteriser(path)
-    pp(chapteriser.chapterise())
+    splitinator = Splitinator(chapteriser)
+    rprint(f":file_folder: [bright_yellow bold]{splitinator.make_foldername()}")
+    filenames = [f"[yellow]{name}" for name in splitinator.make_filenames()]
+    columns = Columns(filenames, equal=True, expand=True)
+    rprint(columns)
+
+    if options.confirm:
+        proceed = Confirm.ask("Do you wish to proceed?", default=False)
+
+    pp(proceed)
 
 
     raise SystemExit(0)
+
     with change_folder(path.parent, verbose=options.verbose):
         chapters = ffprobe_data(path.name, verbose=options.verbose)
 
@@ -574,5 +623,9 @@ def main(options: argparse.Namespace) -> int:
 
 
 if __name__ == '__main__':
+    FORMAT = "%(message)s"
+    logging.basicConfig(
+        level="NOTSET", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
+    )
     options = parse(sys.argv[1:])
     sys.exit(main(options))
