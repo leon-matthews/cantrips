@@ -70,8 +70,7 @@ def change_folder(folder: Path, verbose: bool = False) -> Iterator[None]:
         None
     """
     old = Path.cwd()
-    if verbose:
-        rprint(f"cd {folder}")
+    logger.info(f"cd '{folder}'")
     os.chdir(folder)
     yield
     os.chdir(old)
@@ -138,8 +137,8 @@ def ffmpeg_extract_audio(
         '-i', str(path),
         '-hide_banner',
         '-vn', '-sn', '-dn',    # Drop video, subtitle and data streams
-        '-ss', str(start),
-        '-to', str(end),
+        '-ss', f"{start:.3f}",
+        '-to', f"{end:.3f}",
         '-codec:a',
         'libmp3lame',
         '-ac', '2',
@@ -147,7 +146,7 @@ def ffmpeg_extract_audio(
         '-n',                   # Don't overwrite existing
         str(output),
     ]
-    result = run(args, verbose=verbose)
+    result = run(args)
     return result
 
 
@@ -205,7 +204,7 @@ def ffprobe(path: Path, verbose: bool = False) -> dict[str, Any]:
 
     data = {}
     try:
-        result = run(args, verbose=verbose)
+        result = run(args)
         data = json.loads(result.stdout)
     except json.decoder.JSONDecodeError:
         message = f"Could not decode JSON output: {result.stdout!r}"
@@ -287,7 +286,7 @@ class Seconds:
             return NotImplemented
 
 
-def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess[str]:
+def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """
     Run external command and capture its output.
 
@@ -296,8 +295,6 @@ def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess[s
     Args:
         args:
             Command and its arguments.
-        verbose:
-            Print command before executing it.
 
     Raises:
         RuntimeError:
@@ -308,8 +305,7 @@ def run(args: list[str], verbose: bool = False) -> subprocess.CompletedProcess[s
     Returns:
         Object holding data about completed process, including stdout.
     """
-    if verbose:
-        rprint(' '.join([shlex.quote(arg) for arg in args]))
+    logger.info(' '.join([shlex.quote(arg) for arg in args]))
     try:
         result = subprocess.run(args, capture_output=True, check=True, text=True)
     except FileNotFoundError:
@@ -469,9 +465,44 @@ class Splitinator:
                 Valid Chapteriser instance.
         """
         self.chapters = chapteriser.chapterise()
-        self.path = chapteriser.path
+        self.media_path = chapteriser.path
+        self.folder = self.media_path.parent / self._make_foldername()
+        self.padding = self._calculate_padding(len(self.chapters))
 
-    def calculate_padding(self, max_value: int) -> int:
+    def filenames(self) -> list[str]:
+        filenames = []
+        for index, chapter in enumerate(self.chapters):
+            name = self._make_filename(index, chapter)
+            filenames.append(name)
+        return filenames
+
+    def create_clip(self, index: int, chapter: Chapter) -> str:
+        """
+        Create a single audio clip into current folder.
+
+        Returns:
+            Name of file that was created.
+        """
+        filename = self._make_filename(index, chapter)
+        ffmpeg_extract_audio(self.media_path, chapter.start, chapter.end, filename)
+        return filename
+
+    def create_folder(self) -> None:
+        """
+        Create parent file for clips to live in.
+
+        Raises:
+            RuntimeError:
+                If folder already exists.
+        """
+        if self.folder.exists():
+            message = f"Output folder already exists: '{self.folder}'"
+            logger.error(message)
+            raise RuntimeError(message)
+
+        self.folder.mkdir()
+
+    def _calculate_padding(self, max_value: int) -> int:
         """
         Calculate the width of padding required for file names.
 
@@ -490,58 +521,31 @@ class Splitinator:
         padding = max(2, math.ceil(math.log(max_value + 1, 10)))
         return padding
 
-    def extract(self):
-        # Output folder
-        self.folder = self.path.parent / self.make_foldername()
-        if self.folder.exists():
-            logger.critical(f"Output folder already exists: {self.folder}")
-            raise SystemExit(1)
-        self.folder.mkdir()
-
-        # Output files
-        with change_folder(self.folder, verbose=self.verbose):
-            for number, chapter in enumerate(self.chapters, 1):
-                filename = self.make_filename(chapter)
-                rprint(f"[{number}/{self.num_chapters}] {filename}")
-                self._extract_chapter(filename, chapter)
-
-    def _extract_chapter(self, output_path, chapter):
-        """
-        Extract a single chapter.
-        """
-        start = float(chapter['start_time'])
-        end = float(chapter['end_time'])
-        input_path = f"../{self.path.name}"
-        ffmpeg_extract_audio(input_path, start, end, output_path, verbose=self.verbose)
-
-    def make_filename(
+    def _make_filename(
         self,
         index: int,
         chapter: Chapter,
-        padding: int = 2,
         suffix: str = 'mp3',
     ) -> str:
         """
-        Build filename
+        Build a single filename.
 
         Args:
             index:
-                Index of
+                Index into chapters list.
+            chapter:
+                Chapter instance.
+
+        Returns:
+            Bare-string filename.
         """
-        name = f"{index:0>{padding}}. {chapter.title}.{suffix}"
+        index = index + 1
+        name = f"{index:0>{self.padding}}. {chapter.title}.{suffix}"
         name = clean_filename(name)
         return name
 
-    def make_filenames(self) -> list[str]:
-        filenames = []
-        padding = self.calculate_padding(len(self.chapters))
-        for index, chapter in enumerate(self.chapters, 1):
-            name = self.make_filename(index, chapter, padding)
-            filenames.append(name)
-        return filenames
-
-    def make_foldername(self) -> str:
-        folder = clean_filename(self.path.stem)
+    def _make_foldername(self) -> str:
+        folder = clean_filename(self.media_path.stem)
         return folder
 
 
@@ -561,15 +565,42 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     # ~ parser.add_argument(
         # ~ '-a', '--add', action='store', metavar='NUM',
         # ~ help='number to add to track index')
-    # ~ parser.add_argument(
-        # ~ '-v', '--verbose', action='store_true',
-        # ~ help="print commands as they are run")
+    parser.add_argument(
+        '-v', '--verbose', action='store_true',
+        help="print commands as they are run")
     parser.add_argument(
         '-y', '--yes', action='store_false', dest='confirm',
         help="assume yes; do not ask for confirmation")
     parser.add_argument('path', metavar='PATH', help='audio file to process')
     options = parser.parse_args()
     return options
+
+
+def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
+    """
+    Preview, then ask user for permission to continue.
+
+    Nothing is returned, no side effects except for a possible system exit.
+
+    Raises:
+        SystemExit:
+            If user chose not to continue.
+    """
+    filenames = splitinator.filenames()
+    total = Seconds(chapteriser.get_duration())
+    average = total / len(filenames)
+    rprint()
+    rprint(f"Creating {len(filenames)} files averaging {average} each,")
+    rprint(f"a total of {total} of audio:")
+    rprint(f":file_folder: {splitinator.folder.name}/")
+
+    columns = Columns(filenames, column_first=True, equal=True, expand=True, padding=(0, 2))
+    rprint(columns)
+    rprint()
+
+    proceed = Confirm.ask("Do you wish to proceed?", default=True)
+    if not proceed:
+        raise SystemExit(0)
 
 
 def main(options: argparse.Namespace) -> int:
@@ -597,44 +628,24 @@ def main(options: argparse.Namespace) -> int:
         preview(chapteriser, splitinator)
 
     # Create folder, create split files
-    rprint("DENNO")
-    sys.exit(1)
-
-
-def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
-    """
-    Preview, then ask user for permission to continue.
-
-    Nothing is returned, no side effects except for a possible system exit.
-
-    Raises:
-        SystemExit:
-            If user chose not to continue.
-    """
-    rprint(f":file_folder: {splitinator.make_foldername()}/")
-    filenames = splitinator.make_filenames()
-    columns = Columns(filenames, equal=True, expand=True)
-    rprint(columns)
-
-    total = Seconds(chapteriser.get_duration())
-    average = total / len(filenames)
-    rprint()
-    rprint(
-        f"Creating {len(filenames)} files averaging {average} each, "
-        f"totalling {total} of audio."
-    )
-
-    proceed = Confirm.ask("Do you wish to proceed?", default=False)
-    if not proceed:
-        raise SystemExit(0)
+    num_chapters = len(splitinator.chapters)
+    try:
+        splitinator.create_folder()
+        with change_folder(splitinator.folder):
+            for index, chapter in enumerate(splitinator.chapters):
+                filename = splitinator.create_clip(index, chapter)
+                rprint(f"[{index+1}/{num_chapters}] {filename}")
+    except RuntimeError as e:
+        rprint(e)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
+    options = parse(sys.argv[1:])
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.INFO if options.verbose else logging.WARNING,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(show_path=False, show_time=False)]
     )
-    options = parse(sys.argv[1:])
     sys.exit(main(options))
