@@ -33,8 +33,12 @@ def hevc_convert(video: Path, temp_folder: Path) -> None:
         '-c:v', 'libx265',
         '-x265-params', 'log-level=warning',
         '-preset', 'slow',
-        '-crf', '28',       # 28 default, 26 for better quality.
-        '-c:a', 'copy',
+        '-tune', 'animation',
+        '-crf', '26',       # 28 default, 26 for better quality.
+        # ~ '-c:a', 'copy',
+        '-ac', '2',
+        '-c:a', 'aac',
+        '-b:a', '128k',
         '-f', 'mp4',
         str(output_video),
     )
@@ -43,6 +47,13 @@ def hevc_convert(video: Path, temp_folder: Path) -> None:
     # -2 means force divisible by 2
     # -vf scale=w=-2:h=720:force_original_aspect_ratio=decrease
     # -vf scale=w=-2:h=1080:force_original_aspect_ratio=decrease
+
+    # Tune
+    # '-tune', 'animation',
+
+    # Downmix audio
+    # -ac 2
+    # -c:a libfdk_aac -b:a 128k
 
     print()
     print("="*80)
