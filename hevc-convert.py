@@ -107,6 +107,11 @@ def build_ffmpeg_args(
             '-vf', 'scale=w=-2:h=1080:force_original_aspect_ratio=decrease',
         ]
 
+    # Subtitles
+    builder.output_options += [
+        '-c:s', 'copy',
+    ]
+
     # Tune
     if options.animation:
         builder.output_options += ['-tune', 'animation']
