@@ -70,6 +70,20 @@ def build_ffmpeg_args(
         options:
             Command-line options
 
+    TODO:
+        Right now only the first audio and subtitle stream are copied across
+        from the input stream. That's usually what I want, and doing anything
+        else involves breaking out the 'map' option. Doing so might be taking
+        my little automatation script too far.
+
+        https://ffmpeg.org/ffmpeg.html#Advanced-options
+
+        Using `-map 0` specifies all streams, while `-map 0:s:1` would copy
+        only the second subtitle stream. To get all subtitle streams you
+        would use `-map 0:s:?`.
+
+        All of the map options need to come before the other input options.
+
     Returns:
         List of arguments.
     """
