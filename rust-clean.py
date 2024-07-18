@@ -6,6 +6,10 @@ Clean-up build files from Rust projects under the current, or given, folder.
 Runs the shell command `cargo clean` in every Rust project that needs it. If a
 folder contains a folder called 'target' AND a file called `Cargo.toml` it
 is considered to need cleaning.
+
+TODO:
+    - Ignore hidden folders to prevent recursing into giant folders
+      like .cache, .virtualenvs, .cargo, etc.
 """
 
 import contextlib
