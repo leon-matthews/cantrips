@@ -6,10 +6,6 @@ Clean-up build files from Rust projects under the current, or given, folder.
 Runs the shell command `cargo clean` in every Rust project that needs it. If a
 folder contains a folder called 'target' AND a file called `Cargo.toml` it
 is considered to need cleaning.
-
-TODO:
-    - Ignore hidden folders to prevent recursing into giant folders
-      like .cache, .virtualenvs, .cargo, etc.
 """
 
 import contextlib
@@ -51,14 +47,21 @@ def find_unclean(root: Path) -> Iterator[Path]:
     """
     Recursive generator over folders found under given root.
 
+    Skips hidden folders, ie. those starting with a period, as we don't need
+    to explore inside `.git`, for example.
+
     Args:
         root:
             Folder to start searching from.
+
+    Returns:
+        Yields paths to folders containing a `target` subfolder and the
+        file `Cargo.toml`.
     """
     ignored_folders = ('.git', 'src', 'target')
     for (dirpath, dirnames, filenames) in root.walk():
         # Don't recurse in ignored folders
-        if dirpath.name in ignored_folders:
+        if dirpath.name.startswith('.'):
             dirnames.clear()
             continue
 
@@ -71,7 +74,7 @@ def main(root: Path) -> int:
     for project in find_unclean(root):
         message = clean(project)
         folder = os.path.relpath(project, root)
-        print(f"Found {folder}/: {message}", file=sys.stderr)
+        print(f"From {folder}\n  {message}", file=sys.stderr)
     return 0
 
 
