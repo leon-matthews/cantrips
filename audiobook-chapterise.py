@@ -352,15 +352,19 @@ class Chapteriser:
 
     target_minutes: int = 20
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, start=1):
         """
         Initialiser.
 
         Args:
             path:
                 Path to media file.
+            start:
+                Number to start counting from, only if chapter names not found
+                in input file.
         """
         self.path = path
+        self.start = start
         self.mediainfo = MediaInfo(self.path)
         self.duration = self.mediainfo.get_duration()
 
@@ -399,8 +403,9 @@ class Chapteriser:
         chapters = []
         start = 0.0
         end = seconds
-        for index in range(1, (num_parts + 1)):
-            chapters.append(Chapter(start, end, f"Part {index}"))
+        for index in range(0, num_parts):
+            name = f"Part {index + self.start}"
+            chapters.append(Chapter(start, end, name))
             start = end
             end += seconds
 
@@ -456,18 +461,22 @@ class Splitinator:
     """
     Split single-file audiobook into seperate files.
     """
-    def __init__(self, chapteriser: Chapteriser):
+    def __init__(self, chapteriser: Chapteriser, start=1):
         """
         Initialiser.
 
         Args:
             chapteriser:
                 Valid Chapteriser instance.
+            start:
+                Number to start counting from for file name prefixes.
         """
         self.chapters = chapteriser.chapterise()
+        self.start = start
         self.media_path = chapteriser.path
         self.folder = self.media_path.parent / self._make_foldername()
-        self.padding = self._calculate_padding(len(self.chapters))
+        max_index = (len(self.chapters) - 1) + self.start
+        self.padding = self._calculate_padding(max_index)
 
     def filenames(self) -> list[str]:
         filenames = []
@@ -539,8 +548,8 @@ class Splitinator:
         Returns:
             Bare-string filename.
         """
-        index = index + 1
-        name = f"{index:0>{self.padding}}. {chapter.title}.{suffix}"
+        prefix = index + self.start
+        name = f"{prefix:0>{self.padding}}. {chapter.title}.{suffix}"
         name = clean_filename(name)
         return name
 
@@ -562,9 +571,13 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     """
     description = "Break audio book into multiple files, one per chapter."
     parser = argparse.ArgumentParser(description=description)
-    # ~ parser.add_argument(
-        # ~ '-a', '--add', action='store', metavar='NUM',
-        # ~ help='number to add to track index')
+    parser.add_argument(
+        '-s', '--start',
+        action='store',
+        default=1,
+        metavar='NUM',
+        type=int,
+        help="Don't start numbering from one")
     parser.add_argument(
         '-v', '--verbose', action='store_true',
         help="print commands as they are run")
@@ -589,7 +602,6 @@ def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
     filenames = splitinator.filenames()
     total = Seconds(chapteriser.get_duration())
     average = total / len(filenames)
-    rprint()
     rprint(f"Creating {len(filenames)} files averaging {average} each,")
     rprint(f"a total of {total} of audio:")
     rprint(f":file_folder: {splitinator.folder.name}/")
@@ -617,8 +629,8 @@ def main(options: argparse.Namespace) -> int:
     # Examine file
     try:
         path = Path(options.path).resolve()
-        chapteriser = Chapteriser(path)
-        splitinator = Splitinator(chapteriser)
+        chapteriser = Chapteriser(path, options.start)
+        splitinator = Splitinator(chapteriser, options.start)
     except RuntimeError as e:
         rprint(e)
         sys.exit(1)
