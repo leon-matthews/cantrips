@@ -8,44 +8,45 @@ contained.
 
 For example::
 
-    $ sitemaps-test.py https://seabreezeapparel.co.nz/
-    Downloaded 685B from: https://seabreezeapparel.co.nz/sitemap.xml
-        7 URLs found is sitemap index.
+    $ sitemaps-test.py lost.co.nz
+    Downloaded 327B from: https://lost.co.nz/sitemap.xml
+        Sitemap index found containing 3 URLs
 
-    Downloaded 877B from: https://seabreezeapparel.co.nz/sitemap-news.xml
-        Found 5 URLs, 5 lastmod, 0 changefreq, and 5 priority fields
-    Downloaded 154B from: https://seabreezeapparel.co.nz/sitemap-pages.xml
-        Found 0 URLs, 0 lastmod, 0 changefreq, and 0 priority fields
-    Downloaded 800B from: https://seabreezeapparel.co.nz/sitemap-inspiration.xml
-        Found 4 URLs, 4 lastmod, 0 changefreq, and 4 priority fields
-    Downloaded 1.6kB from: https://seabreezeapparel.co.nz/sitemap-brands.xml
-        Found 11 URLs, 11 lastmod, 0 changefreq, and 11 priority fields
-    Downloaded 2.2kB from: https://seabreezeapparel.co.nz/sitemap-collections.xml
-        Found 16 URLs, 16 lastmod, 0 changefreq, and 16 priority fields
-    Downloaded 69kB from: https://seabreezeapparel.co.nz/sitemap-products.xml
-        Found 495 URLs, 495 lastmod, 0 changefreq, and 495 priority fields
-    Downloaded 861B from: https://seabreezeapparel.co.nz/sitemap-static.xml
-        Found 6 URLs, 0 lastmod, 6 changefreq, and 6 priority fields
+    Downloaded 1.6kB from: https://lost.co.nz/sitemap-links.xml
+        Found 12 URLs, 12 lastmod, 12 changefreq, and 12 priority fields
+    Downloaded 2.3kB from: https://lost.co.nz/sitemap-articles.xml
+        Found 17 URLs, 17 lastmod, 17 changefreq, and 17 priority fields
+    Downloaded 1.2kB from: https://lost.co.nz/sitemap-projects.xml
+        Found 9 URLs, 9 lastmod, 9 changefreq, and 9 priority fields
 
-    Total of 537 URLs found in 8 files
+    Total of 39 URLs found in 4 files
+
+
+Requires:
+    Python 3.9+ and the 3rd-party `requests` library for HTTP downloads.
 
 """
 
 import argparse
+import collections
 from dataclasses import dataclass
 from enum import Enum
+import functools
 import io
 import logging
 import math
 import sys
-from typing import IO, Iterator, List, Optional
-from urllib.parse import urlsplit, urlunsplit
+from typing import IO, Iterator, List, Optional, TypeAlias
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import requests
 
 
 logger = logging.getLogger(__name__)
+
+
+XML: TypeAlias = Iterator[ElementTree.Element]
 
 
 def file_size(size: int, traditional: bool = False) -> str:
@@ -63,7 +64,8 @@ def file_size(size: int, traditional: bool = False) -> str:
             Use traditional base-2 units, otherwise default to using
             'proper' SI multiples of 1000.
 
-    Returns: Short string, like '4.3kB'
+    Returns:
+        Short string, like '4.3kB'
     """
     try:
         size = int(size)
@@ -97,6 +99,14 @@ def file_size(size: int, traditional: bool = False) -> str:
     return '{:,}{}'.format(int(round(divided)), suffix)
 
 
+def find_text(elem: ElementTree.Element, tag: str) -> Optional[str]:
+    """
+    Simple helper to find text inside tag inside element or return none.
+    """
+    found = elem.find(tag)
+    return None if found is None else found.text
+
+
 def round_significant(number: float, digits: int = 2) -> float:
     """
     Round number to the given number of sigificant digits. eg::
@@ -104,7 +114,8 @@ def round_significant(number: float, digits: int = 2) -> float:
         >>> round_significant(1235, digits=2)
         1200
 
-    Returns: Number rounded to the given number of digits
+    Returns:
+        Number rounded to the given number of digits
     """
     digits = int(digits)
     if digits <= 0:
@@ -118,25 +129,30 @@ def round_significant(number: float, digits: int = 2) -> float:
     return round(number, ndigits)
 
 
-def xml_strip_iterparse(file_: IO[str]) -> Iterator[ElementTree.Element]:
+def xml_strip_iterparse(file_: IO[str]) -> XML:
     """
     Iterate the given file into XML, while stripping namespace prefixes.
 
-    Reading is performed incrementally, using `ElementTree.iterparse()`. This
-    has the advantage of being able to start processing as soon as loading
-    starts, and not having to hold the document in memory.
+    Python's `xml.etree` parser is performant and its API is easy to work
+    *except* when the document has a namespace, in which case that namespace
+    is forced into every lookup, eg.
 
-    The disadvantage is that elements are not sent out in the order in which
-    they appear in the document, but rather as soon as their closing tag is
-    encountered.
+        >>> elem.find('{http://www.sitemaps.org/schemas/sitemap/0.9}urlset')
+
+    This function manipulates the tree so that that is no longer required.
+
+        >>> elem.find('urlset')
+
+    There has been discussion about addressing this problem in core Python,
+    but at the time of writing, that has yet to be introduced into the stdlib.
 
     Args:
         file_:
             A file-like object.
 
-    Yields: Element
-        A single `ElementTree.Element` object as they are closed, ie. not in
-        document order.
+    Returns:
+        A generator over input file, to allow for large inputs, yielding
+        `ElementTree.Element` objects
     """
     for event, element in ElementTree.iterparse(file_):
         # Replace 'tag' string
@@ -151,8 +167,7 @@ def xml_strip_iterparse(file_: IO[str]) -> Iterator[ElementTree.Element]:
                 if name and isinstance(name, str) and name[0] == '{':
                     del attrib[name]
                     attrib[name.partition('}')[2]] = value
-
-        yield(element)
+        yield element
 
 
 class ChangeFreq(Enum):
@@ -167,27 +182,31 @@ class ChangeFreq(Enum):
 
 @dataclass
 class Location:
+    """
+    Collect the core fields for sitemap elements that describe an end-point.
+
+    Used by `SitemapReader.read_sitemap()`
+    """
     loc: str
     lastmod: Optional[str]
     changefreq: Optional[str]
     priority: Optional[float]
 
 
-class SitemapReader:
-    """
-    Downloads and parses sitemap index and list files.
-    """
+class Downloader:
     def __init__(self, base_url: str):
         """
-        Initialise sitemap.xml reader.
+        Initialiser.
 
         Args:
             base_url (str):
                 The URL of the top-level sitemap resource, eg.
                 'https://example.com'
         """
+        self.base_url = self._clean_url(base_url)
+
+        # Allow reuse of TCP connection
         self.session = requests.session()
-        self.url_parts = urlsplit(base_url)
 
     def build_url(self, path: str) -> str:
         """
@@ -199,46 +218,128 @@ class SitemapReader:
 
         Returns:
             Absolute URL
-        """
-        parts = self.url_parts._replace(path=path)
-        return urlunsplit(parts)
 
-    def download_xml(self, url: str) -> Iterator[ElementTree.Element]:
         """
-        Fetch a single XML resource.
+        parts = urlsplit(self.base_url)
+        if not parts.scheme:
+            parts._replace(scheme='https')
+        parts = parts._replace(path=path)
+        url = urlunsplit(parts)
+        return url
+
+    @functools.lru_cache(maxsize=1)
+    def get_text(self, url: str) -> str:
+        """
+        Fetch a single resource and convert to unicode string.
 
         Args:
             url:
-                Full URL to XML document.
+                Absolute URL to resource, eg. 'https://example.com/robots.txt'
 
         Raises:
             RuntimeError:
                 On any network problems.
 
         Returns:
-            Iterator, as built by `xml_strip_iterparse()`
+            Plain unicode string.
         """
         try:
             response = self.session.get(url, stream=True, timeout=5.0)
             response.raise_for_status()
+            text = response.text
         except requests.exceptions.HTTPError as e:
             logger.error(e)
             raise RuntimeError(e) from None
         except requests.exceptions.RequestException as e:
             logger.error(e)
             raise RuntimeError(e) from None
-        file_ = io.StringIO(response.text)
-        size = file_size(len(response.text))
-        logger.info('Downloaded %s from: %s', size, url)
+
+        logger.info('Downloaded %s from: %s', file_size(len(text)), url)
+        return text
+
+    def get_xml(self, url: str) -> XML:
+        """
+        Fetch and pre-parse XML resource
+
+        Args:
+            url:
+               Full URL to resource, eg. 'https://example.com/sitemap.xml'
+
+        Returns:
+            Iterator, as built by `xml_strip_iterparse()`
+        """
+        # Build file-like object from string for `xml.etree`
+        text = self.get_text(url)
+        file_ = io.StringIO(text)
         yield from xml_strip_iterparse(file_)
 
-    def read_index(self) -> List[str]:
+    def _clean_url(self, base_url: str) -> str:
         """
-        Download root sitemap.xml and find URLs to detail sitemaps.
+        Add schema to base_url, if missing.
+        """
+        parts = urlsplit(base_url)
+        if not parts.scheme:
+            parts = SplitResult('https', parts.path, '', '', '')
+        return urlunsplit(parts)
+
+
+class SitemapReader:
+    """
+    Parse sitemap index and list files.
+    """
+    def __init__(self, domain: str):
+        """
+        Initialiser.
+
+        Args:
+            domain:
+                The hostname of website to check, eg. example.com
+        """
+        self.downloader = Downloader(domain)
+
+    def print_index(self, urls: list[str]) -> None:
+        """
+        Print details about the sitemap index, and the sitemaps pointed to.
+        """
+        total_urls = 1                  # We started with '/sitemap.xml'
+        print(f"    Sitemap index found containing {len(urls):,} URLs")
+        print()
+
+        for url in urls:
+            locations = self.read_sitemap(url)
+            self.print_sitemap(locations)
+            total_urls += len(locations)
+
+        print()
+        print(f"Total of {total_urls:,} URLs found in {len(urls) + 1} files")
+
+    def print_sitemap(self, locations: List[Location]) -> None:
+        """
+        Print basic details about sitemap file.
+        """
+        fields = ('loc', 'lastmod', 'changefreq', 'priority')
+
+        # Build count of implemented fields
+        counts: dict[str, int] = collections.Counter()
+
+        for location in locations:
+            for field in fields:
+                if hasattr(location, field):
+                    counts[field] += 1
+
+        print(
+            f"    Found {counts['loc']:,} URLs, {counts['lastmod']:,} lastmod, "
+            f"{counts['changefreq']:,} changefreq, and "
+            f"{counts['priority']:,} priority fields"
+        )
+
+    def read_index(self, path: str) -> tuple[list[str], list[Location]]:
+        """
+        Extract URLs to detail sitemaps, if any, from sitemap index.
 
         <sitemapindex>
             <sitemap>
-                <loc>https://example.com/sitemap-news-articles.xml</loc>
+            <loc>https://example.com/sitemap-news-articles.xml</loc>
             </sitemap>
             ...
         </sitemapindex>
@@ -246,20 +347,31 @@ class SitemapReader:
         We should download these other sitemaps and add their 'url' elements
         to the processing queue.
 
+        Args:
+            path:
+                Path to file, eg '/sitemap.xml'
+
         Returns:
             List of URLs to sitemap files.
         """
-        index_url = self.build_url('sitemap.xml')
-        data = self.download_xml(index_url)
+
+        url = self.downloader.build_url(path)
+        data = self.downloader.get_xml(url)
+
         urls = []
         for elem in data:
-            if elem.tag == 'loc':
-                url = elem.text
-                assert isinstance(url, str)
-                urls.append(url)
-        return urls
+            if elem.tag == 'sitemap':
+                loc = find_text(elem, 'loc')
+                if loc is None:
+                    raise ValueError('Missing required <loc> element')
+                else:
+                    urls.append(loc)
 
-    def read_sitemap(self, url: str) -> List[Location]:
+        locations = self.read_sitemap(url)
+
+        return (urls, locations)
+
+    def read_sitemap(self, path: str) -> List[Location]:
         """
         Download sitemap file, build list of `Location` data objects.
 
@@ -274,8 +386,8 @@ class SitemapReader:
         </urlset>
 
         Args:
-            url:
-                Full URL to resource.
+            path:
+                Path to sitemap file, eg, "/sitemap-products.xml"
 
         Raises:
             ValueError:
@@ -284,12 +396,8 @@ class SitemapReader:
         Returns:
             List of `Location` dataclass instances.
         """
-        def find_text(elem: ElementTree.Element, tag: str) -> Optional[str]:
-            found = elem.find(tag)
-            return None if found is None else found.text
-
-        data = self.download_xml(url)
         locations = []
+        data = self.downloader.get_xml(path)
         for elem in data:
             if elem.tag == 'url':
                 priority = (
@@ -311,43 +419,6 @@ class SitemapReader:
         return locations
 
 
-def main(options: argparse.Namespace) -> None:
-    setup_logging()
-    sitemaps = SitemapReader(options.url_base)
-    urls = sitemaps.read_index()
-
-    print(f"    {len(urls):,} URLs found is sitemap index.")
-    print()
-
-    num_urls_total = 0
-    for url in urls:
-        locations = sitemaps.read_sitemap(url)
-
-        num_locs = 0
-        num_lastmod = 0
-        num_changefreq = 0
-        num_priority = 0
-        for location in locations:
-            if location.loc:
-                num_locs += 1
-            if location.lastmod:
-                num_lastmod += 1
-            if location.changefreq:
-                num_changefreq += 1
-            if location.priority:
-                num_priority += 1
-
-        num_urls_total += num_locs
-        print(
-            f"    Found {num_locs:,} URLs, {num_lastmod:,} lastmod, "
-            f"{num_changefreq:,} changefreq, and "
-            f"{num_priority:,} priority fields"
-        )
-
-    print()
-    print(f"Total of {num_urls_total:,} URLs found in {len(urls) + 1} files")
-
-
 def parse(arguments: List[str]) -> argparse.Namespace:
     """
     Parse command-line arguments to produce set of options to give to `main()`.
@@ -356,10 +427,8 @@ def parse(arguments: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         'url_base',
-        default='http://localhost:8000',
         metavar='BASE_URL',
-        nargs='?',
-        help='Base url of site, eg. http://localhost:8000')
+        help='Base url of site, eg. https://example.com/')
     return parser.parse_args()
 
 
@@ -370,12 +439,27 @@ def setup_logging() -> None:
     )
 
 
+def main(options: argparse.Namespace) -> None:
+    """
+    Script entry point.
+    """
+    setup_logging()
+    sitemaps = SitemapReader(options.url_base)
+    urls, locations = sitemaps.read_index('/sitemap.xml')
+
+    # Sitemap index or plain file?
+    if urls:
+        sitemaps.print_index(urls)
+    else:
+        sitemaps.print_sitemap(locations)
+
+
 if __name__ == '__main__':
-    error = 0
+    exit_code = 0
     options = parse(sys.argv[1:])
     try:
         main(options)
     except RuntimeError as e:
         print(e, file=sys.stderr)
-        error = 1
-    sys.exit(error)
+        exit_code = 1
+    sys.exit(exit_code)
