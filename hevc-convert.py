@@ -47,6 +47,9 @@ class FFmpegArgumentBuilder:
         args = ['ffmpeg'] + self.global_options
         args += self.input_options
         args += ['-i', str(self.input_path)]
+        args += ['-map', '0:v:0']       # Keep first video stream
+        args += ['-map', '0:a:0']       # Keep first audio stream
+        args += ['-map', '0:s']         # Keep all subtitle streams
         args += self.output_options
         args += [str(self.output_path)]
         return args
