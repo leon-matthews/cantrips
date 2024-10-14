@@ -104,6 +104,20 @@ def build_ffmpeg_args(
     else:
         builder.output_options += ['-crf', '28']
 
+    # Video filters
+    if options.scale_720:
+        builder.output_options += [
+            '-vf', 'scale=w=-2:h=720:force_original_aspect_ratio=decrease',
+        ]
+    if options.scale_1080:
+        builder.output_options += [
+            '-vf', 'scale=w=-2:h=1080:force_original_aspect_ratio=decrease',
+        ]
+    if options.deinterlace:
+        builder.output_options += [
+            '-vf', 'bwdif=mode=send_field:parity=auto:deint=all',
+        ]
+
     # Audio
     if options.stereo:
         builder.output_options += [
@@ -114,15 +128,6 @@ def build_ffmpeg_args(
     else:
         builder.output_options += ['-c:a', 'copy']
 
-    # Scale
-    if options.scale_720:
-        builder.output_options += [
-            '-vf', 'scale=w=-2:h=720:force_original_aspect_ratio=decrease',
-        ]
-    if options.scale_1080:
-        builder.output_options += [
-            '-vf', 'scale=w=-2:h=1080:force_original_aspect_ratio=decrease',
-        ]
 
     # Subtitles
     builder.output_options += [
@@ -247,6 +252,13 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         action='store_true',
         dest='scale_1080',
         help="downsize to 1080p, keeping aspect ratio",
+    )
+
+    # Deinterlace
+    parser.add_argument(
+        '--deinterlace',
+        action='store_true',
+        help="Deinterlace video using the 'bwdif' filter",
     )
 
     # Animation
