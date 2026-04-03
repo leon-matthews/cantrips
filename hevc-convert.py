@@ -8,6 +8,18 @@ Recompress video files in place to HEVC using FFMPEG and libx265.
 TODO:
     - Change FFMPEG arguments based on command line options.
     - Fill implementation of secure_copy()
+
+
+2025-08-27
+    Experimented with AV1 encoding, using the `libsvtav1` encoder. Underwhelming,
+    but more experimentation/comparison needed:
+
+        ffmpeg -i input.mp4 \
+            -ss 00:01:00 -to 00:02:00 \
+            -map 0:v:0 -map 0:a:0 -map 0:s? \
+            -c:v libsvtav1 -crf 35 -preset 4 \
+            -c:a libopus -c:s copy output.mkv
+
 """
 
 import argparse
@@ -49,7 +61,7 @@ class FFmpegArgumentBuilder:
         args += ['-i', str(self.input_path)]
         args += ['-map', '0:v:0']       # Keep first video stream
         args += ['-map', '0:a:0']       # Keep first audio stream
-        args += ['-map', '0:s?']         # Keep all subtitle streams
+        args += ['-map', '0:s?']        # Keep all subtitle streams
         args += self.output_options
         args += [str(self.output_path)]
         return args
@@ -73,20 +85,6 @@ def build_ffmpeg_args(
         options:
             Command-line options
 
-    TODO:
-        Right now only the first audio and subtitle stream are copied across
-        from the input stream. That's usually what I want, and doing anything
-        else involves breaking out the 'map' option. Doing so might be taking
-        my little automatation script too far.
-
-        https://ffmpeg.org/ffmpeg.html#Advanced-options
-
-        Using `-map 0` specifies all streams, while `-map 0:s:1` would copy
-        only the second subtitle stream. To get all subtitle streams you
-        would use `-map 0:s:?`.
-
-        All of the map options need to come before the other input options.
-
     Returns:
         List of arguments.
     """
@@ -98,20 +96,23 @@ def build_ffmpeg_args(
     ]
 
     # Quality
-    builder.output_options += ['-preset', 'slow']
     if options.better:
-        builder.output_options += ['-crf', '26']
+        builder.output_options += ['-preset', 'slower', '-crf', '26']
     else:
-        builder.output_options += ['-crf', '28']
+        builder.output_options += ['-preset', 'slow', '-crf', '28']
 
     # Video filters
+    if options.scale_480:
+        builder.output_options += [
+            '-vf', "scale=w=-2:h='min(480,ih)'",
+        ]
     if options.scale_720:
         builder.output_options += [
-            '-vf', 'scale=w=-2:h=720:force_original_aspect_ratio=decrease',
+            '-vf', "scale=w=-2:h='min(720,ih)'",
         ]
     if options.scale_1080:
         builder.output_options += [
-            '-vf', 'scale=w=-2:h=1080:force_original_aspect_ratio=decrease',
+            '-vf', "scale=w=-2:h='min(1080,ih)'",
         ]
     if options.deinterlace:
         builder.output_options += [
@@ -141,12 +142,12 @@ def build_ffmpeg_args(
     return builder.args()
 
 
-def hevc_convert(video: Path, temp_folder: Path, options: argparse.Namespace) -> None:
+def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace) -> None:
     """
     Convert video in-place.
 
     Args:
-        video:
+        original:
             Path to input file.
         temp_folder:
             Folder to save partially encoded file into.
@@ -156,45 +157,30 @@ def hevc_convert(video: Path, temp_folder: Path, options: argparse.Namespace) ->
     Returns:
         None
     """
-    # Recompress into new file
-    output_video = temp_folder / video.name
-    builder = FFmpegArgumentBuilder(video, output_video)
-    args = build_ffmpeg_args(video, output_video, options)
+    logger.info("START compressing HEVC MP4 video: %s", original.name)
+
+    # Recompress output original into temporary folder
+    output_name = original.with_suffix('.mp4').name
+    output_video = temp_folder / output_name
+    builder = FFmpegArgumentBuilder(original, output_video)
+    args = build_ffmpeg_args(original, output_video, options)
 
     print()
     print("="*80)
-    print(video.name)
+    print(original.name)
     print("="*80)
     print(" ".join(args))
     print()
-    subprocess.run(args, check=True)
 
-    # Replace original file
-    shutil.copyfile(output_video, video)
+    logger.info("Execute FFMPEG, output to: %s", output_video)
+    if not options.dry_run:
+        subprocess.run(args, check=True)
 
-    # Remove new file
+    # Copy new file into same folder (and maybe over top of) original file
+    shutil.copyfile(output_video, original.parent / output_name)
+
+    # Remove temp file
     output_video.unlink()
-
-
-def secure_copy(old: Path, new: Path, exist_ok: bool = False) -> None:
-    """
-    Copy file into new location avoiding partial copy errors.
-
-    Even if interupted, file should not be left in a partially copied state.
-    It is first copied to the destination folder using a temporary name,
-    then renamed to the final name only when copy is completed.
-
-    Args:
-        old:
-            Current
-        new:
-            Location to copy file to.
-        exist_ok:
-            Will silently overwrite any existing file if true.
-
-    Returns:
-        None
-    """
 
 
 def main(options: argparse.Namespace) -> int:
@@ -202,6 +188,10 @@ def main(options: argparse.Namespace) -> int:
 
     with TemporaryDirectory(prefix='hevc-convert-') as temp_folder:
         for video in videos:
+            if video.is_dir():
+                logger.info("Skipping folder: %s", video)
+                continue
+
             hevc_convert(video, Path(temp_folder), options)
 
     return 0
@@ -215,38 +205,51 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         description="Recompress video files in place",
     )
 
-    # Files
+    # --animation
     parser.add_argument(
-        dest='videos',
-        metavar='VIDEO',
-        nargs='+',
-        help="One or more video files to recompress using x265",
+        '--animation', action='store_true',
+        help='Hint to encoder that input is animation',
     )
 
-    # Quality
+    # --better, -b
     parser.add_argument(
-        '-b',
-        '--better',
-        action='store_true',
+        '-b', '--better', action='store_true',
         help='improve video quality by changing x265 CRF value from 28 to 26',
     )
 
-    # Audio
+    # --deinterlace
     parser.add_argument(
-        '--stereo',
+        '--deinterlace',
         action='store_true',
+        help="Deinterlace using the 'bwdif' filter",
+    )
+
+    # --dry-run, -n
+    parser.add_argument(
+        '-n', '--dry-run', action='store_true',
+        help='only show which files would be transfered',
+    )
+
+    # --stereo, -s
+    parser.add_argument(
+        '-s', '--stereo', action='store_true',
         help='Force stereo audio, downmixing channels if necessary',
     )
 
-    # Resize
+    # --480, --720, --1080
     resize_parser = parser.add_mutually_exclusive_group()
+    resize_parser.add_argument(
+        '--480',
+        action='store_true',
+        dest='scale_480',
+        help="downsize to 480p, keeping aspect ratio",
+    )
     resize_parser.add_argument(
         '--720',
         action='store_true',
         dest='scale_720',
         help="downsize to 720p, keeping aspect ratio",
     )
-
     resize_parser.add_argument(
         '--1080',
         action='store_true',
@@ -254,18 +257,12 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         help="downsize to 1080p, keeping aspect ratio",
     )
 
-    # Deinterlace
+    # File arguments
     parser.add_argument(
-        '--deinterlace',
-        action='store_true',
-        help="Deinterlace video using the 'bwdif' filter",
-    )
-
-    # Animation
-    parser.add_argument(
-        '--animation',
-        action='store_true',
-        help='Hint to encoder that input is animation',
+        dest='videos',
+        metavar='VIDEO',
+        nargs='+',
+        help="One or more video files to recompress using x265",
     )
 
     options = parser.parse_args(args)
@@ -274,5 +271,9 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
 
 if __name__ == '__main__':
     options = parse_arguments(sys.argv[1:])
+    logging.basicConfig(
+        format='%(message)s',
+        level=logging.INFO,
+    )
     status = main(options)
     sys.exit(status)
