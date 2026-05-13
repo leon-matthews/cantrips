@@ -32,6 +32,7 @@ TODO:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
@@ -43,6 +44,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 from typing import Any, Iterator, Union
 
 from rich import print as rprint
@@ -53,6 +55,8 @@ from rich.prompt import Confirm
 
 
 logger = logging.getLogger(__name__)
+
+_print_lock = threading.Lock()
 
 
 @contextmanager
@@ -485,16 +489,11 @@ class Splitinator:
             filenames.append(name)
         return filenames
 
-    def create_clip(self, index: int, chapter: Chapter) -> str:
+    def create_clip(self, chapter: Chapter, filename: str) -> None:
         """
         Create a single audio clip into current folder.
-
-        Returns:
-            Name of file that was created.
         """
-        filename = self._make_filename(index, chapter)
         ffmpeg_extract_audio(self.media_path, chapter.start, chapter.end, filename)
-        return filename
 
     def create_folder(self) -> None:
         """
@@ -572,6 +571,13 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     description = "Break audio book into multiple files, one per chapter."
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
+        '-j', '--jobs',
+        action='store',
+        default=min(4, os.cpu_count() or 1),
+        metavar='N',
+        type=int,
+        help="number of concurrent ffmpeg processes (default: %(default)s)")
+    parser.add_argument(
         '-s', '--start',
         action='store',
         default=1,
@@ -640,15 +646,44 @@ def main(options: argparse.Namespace) -> int:
         preview(chapteriser, splitinator)
 
     # Create folder, create split files
+    filenames = splitinator.filenames()
     num_chapters = len(splitinator.chapters)
+    errors: list[tuple[str, Exception]] = []
+
+    def _worker(index: int, chapter: Chapter, filename: str) -> str:
+        with _print_lock:
+            rprint(f"[→] {filename}")
+        splitinator.create_clip(index, chapter)
+        return filename
+
     try:
         splitinator.create_folder()
         with change_folder(splitinator.folder):
-            for index, chapter in enumerate(splitinator.chapters):
-                filename = splitinator.create_clip(index, chapter)
-                rprint(f"[{index+1}/{num_chapters}] {filename}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=options.jobs) as pool:
+                futures = {
+                    pool.submit(_worker, i, ch, fn): fn
+                    for i, (ch, fn) in enumerate(zip(splitinator.chapters, filenames))
+                }
+                completed = 0
+                for future in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    filename = futures[future]
+                    try:
+                        future.result()
+                        with _print_lock:
+                            rprint(f"[✓ {completed}/{num_chapters}] {filename}")
+                    except RuntimeError as e:
+                        errors.append((filename, e))
+                        with _print_lock:
+                            rprint(f"[✗ {completed}/{num_chapters}] {filename}: {e}")
     except RuntimeError as e:
         rprint(e)
+        sys.exit(1)
+
+    if errors:
+        rprint(f"\n[red]{len(errors)} of {num_chapters} chapters failed:[/red]")
+        for filename, e in errors:
+            rprint(f"  - {filename}: {e}")
         sys.exit(1)
 
 
