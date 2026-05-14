@@ -22,10 +22,6 @@ Requirements:
     https://ffmpeg.org/
     https://rich.readthedocs.io/en/latest/
 
-TODO:
-    * Finish replacing confirmation dialog.
-    * Refactor with on eye on responsibilities.
-
 """
 
 from __future__ import annotations
@@ -313,15 +309,15 @@ class Chapter:
     title: str
 
 
-class Chapteriser:
+class ChapterPlanner:
     """
     Plan out the chapters that audiobook should be broken up into.
 
     The output of this class is only a list of `Chapter` objects which are
     either extracted from the original file's metadata, or built-up manually.
 
-        >>> chapteriser = Chapteriser(path_to_media)
-        >>> chapteriser.chapterise()
+        >>> planner = ChapterPlanner(path_to_media)
+        >>> planner.plan()
         [Chapter(start=0, end=1190.5872723555556, title='Part 1'),
          Chapter(start=1190.5872723555556, end=2381.174544711111, title='Part 2'),
          ...
@@ -335,7 +331,7 @@ class Chapteriser:
 
     target_minutes: int = 20
 
-    def __init__(self, path: Path, start=1):
+    def __init__(self, path: Path, start: int = 1):
         """
         Initialiser.
 
@@ -346,25 +342,20 @@ class Chapteriser:
                 Number to start counting from, only if chapter names not found
                 in input file.
         """
-        self.path = path
         self.start = start
-        self.mediainfo = MediaInfo(self.path)
+        self.mediainfo = MediaInfo(path)
         self.duration = self.mediainfo.get_duration()
 
-    def chapterise(self) -> list[Chapter]:
+    def plan(self) -> list[Chapter]:
         """
         Create chapters.
 
         Returns:
             List of chapter instances.
         """
-        # From metadata?
         chapters = self.mediainfo.get_chapters()
-
-        # Fallback to fixed-sized parts
         if not chapters:
             chapters = self.make_parts()
-
         return chapters
 
     def get_duration(self) -> float:
@@ -440,85 +431,25 @@ class MediaInfo:
         return chapters
 
 
-class Splitinator:
+class ClipNamer:
     """
-    Split single-file audiobook into seperate files.
+    Build filenames and folder name for the output clips.
     """
-    def __init__(self, chapteriser: Chapteriser):
+    def __init__(self, start: int, num_chapters: int):
         """
         Initialiser.
 
         Args:
-            chapteriser:
-                Valid Chapteriser instance.
+            start:
+                Number to start counting from for the filename prefix.
+            num_chapters:
+                Total chapter count, used to size the zero-padding.
         """
-        self.chapters = chapteriser.chapterise()
-        self.start = chapteriser.start
-        self.media_path = chapteriser.path
-        self.folder = self.media_path.parent / self._make_foldername()
-        max_index = (len(self.chapters) - 1) + self.start
-        self.padding = self._calculate_padding(max_index)
+        self.start = start
+        max_index = (num_chapters - 1) + start
+        self.padding = self.calculate_padding(max_index)
 
-    def filenames(self) -> list[str]:
-        filenames = []
-        for index, chapter in enumerate(self.chapters):
-            name = self._make_filename(index, chapter)
-            filenames.append(name)
-        return filenames
-
-    def create_clip(self, index: int, chapter: Chapter) -> str:
-        """
-        Create a single audio clip in the output folder.
-
-        The clip is written to a ``.part`` file and atomically renamed on
-        success, so an interrupted run leaves partial clips clearly marked.
-
-        Returns:
-            Name of file that was created.
-        """
-        filename = self._make_filename(index, chapter)
-        final = self.folder / filename
-        partial = final.with_name(final.name + '.part')
-        ffmpeg_extract_audio(self.media_path, chapter.start, chapter.end, partial)
-        partial.rename(final)
-        return filename
-
-    def create_folder(self) -> None:
-        """
-        Create parent file for clips to live in.
-
-        Raises:
-            RuntimeError:
-                If folder already exists.
-        """
-        if self.folder.exists():
-            message = f"Output folder already exists: '{self.folder}'"
-            logger.error(message)
-            raise RuntimeError(message)
-
-        self.folder.mkdir()
-
-    @staticmethod
-    def _calculate_padding(max_value: int) -> int:
-        """
-        Calculate the width of padding required for file names.
-
-            >>> padding_digits(33)
-            2
-            >>> padding_digits(1000)
-            4
-
-        Args:
-            max_value:
-                Highest number required.
-
-        Return:
-            Number of padding digits required.
-        """
-        padding = max(2, math.ceil(math.log(max_value + 1, 10)))
-        return padding
-
-    def _make_filename(
+    def filename(
         self,
         index: int,
         chapter: Chapter,
@@ -538,12 +469,82 @@ class Splitinator:
         """
         prefix = index + self.start
         name = f"{prefix:0>{self.padding}}. {chapter.title}.{suffix}"
-        name = clean_filename(name)
-        return name
+        return clean_filename(name)
 
-    def _make_foldername(self) -> str:
-        folder = clean_filename(self.media_path.stem)
-        return folder
+    def foldername(self, media_stem: str) -> str:
+        """
+        Build the output folder name from the source file's stem.
+        """
+        return clean_filename(media_stem)
+
+    @staticmethod
+    def calculate_padding(max_value: int) -> int:
+        """
+        Calculate the width of padding required for file names.
+
+            >>> ClipNamer.calculate_padding(33)
+            2
+            >>> ClipNamer.calculate_padding(1000)
+            4
+
+        Args:
+            max_value:
+                Highest number required.
+
+        Returns:
+            Number of padding digits required.
+        """
+        return max(2, math.ceil(math.log(max_value + 1, 10)))
+
+
+class ClipWriter:
+    """
+    Extract audio clips from the source file into an output folder.
+    """
+    def __init__(self, media_path: Path, folder: Path):
+        """
+        Initialiser.
+
+        Args:
+            media_path:
+                Path to the source media file.
+            folder:
+                Path to the output folder clips will be written into.
+        """
+        self.media_path = media_path
+        self.folder = folder
+
+    def create_folder(self) -> None:
+        """
+        Create parent folder for clips to live in.
+
+        Raises:
+            RuntimeError:
+                If folder already exists.
+        """
+        if self.folder.exists():
+            message = f"Output folder already exists: '{self.folder}'"
+            logger.error(message)
+            raise RuntimeError(message)
+
+        self.folder.mkdir()
+
+    def write(self, chapter: Chapter, output_path: Path) -> None:
+        """
+        Extract a single chapter to the given output path.
+
+        The clip is written to a ``.part`` file and atomically renamed on
+        success, so an interrupted run leaves partial clips clearly marked.
+
+        Args:
+            chapter:
+                Chapter to extract from the source file.
+            output_path:
+                Final path the clip should land at.
+        """
+        partial = output_path.with_name(output_path.name + '.part')
+        ffmpeg_extract_audio(self.media_path, chapter.start, chapter.end, partial)
+        partial.rename(output_path)
 
 
 def parse(arguments: list[str]) -> argparse.Namespace:
@@ -586,7 +587,12 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     return options
 
 
-def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
+def preview(
+    chapters: list[Chapter],
+    namer: ClipNamer,
+    folder: Path,
+    duration: float,
+) -> None:
     """
     Preview, then ask user for permission to continue.
 
@@ -596,12 +602,12 @@ def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
         SystemExit:
             If user chose not to continue.
     """
-    filenames = splitinator.filenames()
-    total = Seconds(chapteriser.get_duration())
+    filenames = [namer.filename(index, ch) for index, ch in enumerate(chapters)]
+    total = Seconds(duration)
     average = total / len(filenames)
     rprint(f"Creating {len(filenames)} files averaging {average} each,")
     rprint(f"a total of {total} of audio:")
-    rprint(f":file_folder: {splitinator.folder.name}/")
+    rprint(f":file_folder: {folder.name}/")
 
     columns = Columns(filenames, column_first=True, equal=True, expand=True, padding=(0, 2))
     rprint(columns)
@@ -610,6 +616,46 @@ def preview(chapteriser: Chapteriser, splitinator: Splitinator) -> None:
     proceed = Confirm.ask("Do you wish to proceed?", default=True)
     if not proceed:
         raise SystemExit(0)
+
+
+def run_encode(
+    writer: ClipWriter,
+    namer: ClipNamer,
+    chapters: list[Chapter],
+    jobs: int,
+) -> None:
+    """
+    Encode each chapter into its own clip, with up to `jobs` ffmpeg jobs in parallel.
+
+    Raises:
+        KeyboardInterrupt:
+            Re-raised after cancelling pending futures so the caller can clean up.
+    """
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    )
+    description = f"Encoding ({jobs} job{'s' if jobs != 1 else ''})"
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = [
+            executor.submit(writer.write, chapter, writer.folder / namer.filename(index, chapter))
+            for index, chapter in enumerate(chapters)
+        ]
+        try:
+            with progress:
+                task = progress.add_task(description, total=len(chapters))
+                for future in as_completed(futures):
+                    future.result()
+                    progress.update(task, advance=1)
+        except KeyboardInterrupt:
+            for f in futures:
+                f.cancel()
+            raise
 
 
 def main(options: argparse.Namespace) -> int:
@@ -623,55 +669,32 @@ def main(options: argparse.Namespace) -> int:
     Returns:
         Integer error code.
     """
-    # Examine file
     try:
         path = Path(options.path).resolve()
-        chapteriser = Chapteriser(path, options.start)
-        splitinator = Splitinator(chapteriser)
+        planner = ChapterPlanner(path, options.start)
+        chapters = planner.plan()
+        namer = ClipNamer(start=options.start, num_chapters=len(chapters))
+        folder = path.parent / namer.foldername(path.stem)
+        writer = ClipWriter(media_path=path, folder=folder)
     except RuntimeError as e:
         rprint(e)
-        sys.exit(1)
+        return 1
 
-    # Preview, then confirm
     if options.confirm:
-        preview(chapteriser, splitinator)
+        preview(chapters, namer, folder, planner.get_duration())
 
-    # Create folder, create split files
-    num_chapters = len(splitinator.chapters)
-    jobs = min(options.jobs, num_chapters)
+    jobs = min(options.jobs, len(chapters))
     try:
-        splitinator.create_folder()
-        progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("•"),
-            TimeRemainingColumn(),
-        )
-        description = f"Encoding ({jobs} job{'s' if jobs != 1 else ''})"
-        with ThreadPoolExecutor(max_workers=jobs) as executor:
-            futures = [
-                executor.submit(splitinator.create_clip, index, chapter)
-                for index, chapter in enumerate(splitinator.chapters)
-            ]
-            try:
-                with progress:
-                    task = progress.add_task(description, total=num_chapters)
-                    for future in as_completed(futures):
-                        future.result()
-                        progress.update(task, advance=1)
-            except KeyboardInterrupt:
-                for f in futures:
-                    f.cancel()
-                raise
+        writer.create_folder()
+        run_encode(writer, namer, chapters, jobs)
     except RuntimeError as e:
         rprint(e)
-        sys.exit(1)
+        return 1
     except KeyboardInterrupt:
         rprint("\n[yellow]Interrupted.[/yellow]")
-        sys.exit(130)
+        return 130
+
+    return 0
 
 
 if __name__ == '__main__':
