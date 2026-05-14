@@ -428,6 +428,7 @@ class MediaInfo:
             title = datum.get('tags', {}).get('title', '')
             chapters.append(Chapter(start, end, title))
 
+        chapters.sort(key=lambda c: c.start)
         return chapters
 
 
@@ -468,7 +469,7 @@ class ClipNamer:
             Bare-string filename.
         """
         prefix = index + self.start
-        name = f"{prefix:0>{self.padding}}. {chapter.title}.{suffix}"
+        name = f"{prefix:0>{self.padding}}. {chapter.title.strip()}.{suffix}"
         return clean_filename(name)
 
     def foldername(self, media_stem: str) -> str:
