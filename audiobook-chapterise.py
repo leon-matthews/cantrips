@@ -25,14 +25,13 @@ Requirements:
 TODO:
     * Finish replacing confirmation dialog.
     * Refactor with on eye on responsibilities.
-    * Split by time chunks if chapters not available.
 
 """
 
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import math
@@ -43,37 +42,23 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Any, Iterator, Union
+from typing import Any
 
 from rich import print as rprint
 from rich.columns import Columns
 from rich.logging import RichHandler
-from rich.pretty import pprint as pp
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.prompt import Confirm
 
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def change_folder(folder: Path, verbose: bool = False) -> Iterator[None]:
-    """
-    Context manager to change working dir, then restore it again.
-
-    Args:
-        folder:
-            Path to folder to change to.
-        verbose:
-            Print directory comman
-
-    Returns:
-        None
-    """
-    old = Path.cwd()
-    logger.info(f"cd '{folder}'")
-    os.chdir(folder)
-    yield
-    os.chdir(old)
 
 
 def clean_filename(filename: str) -> str:
@@ -108,7 +93,6 @@ def ffmpeg_extract_audio(
     output: Path,
     *,
     quality: int = 6,
-    verbose: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """
     Run ``ffmpeg`` to extract audio clip from input.
@@ -126,14 +110,13 @@ def ffmpeg_extract_audio(
             Optionally overide MP3 LAME quality setting. The default value is
             chosen to give small file sizes with acceptable quality for audio
             books.
-        verbose:
-            Print command-line before running it.
 
     Returns:
         Subprocess completed process.
     """
     args = [
         'ffmpeg',
+        '-nostdin',
         '-i', str(path),
         '-hide_banner',
         '-vn', '-sn', '-dn',    # Drop video, subtitle and data streams
@@ -143,6 +126,7 @@ def ffmpeg_extract_audio(
         'libmp3lame',
         '-ac', '2',
         '-qscale:a', str(quality),
+        '-f', 'mp3',
         '-n',                   # Don't overwrite existing
         str(output),
     ]
@@ -150,7 +134,7 @@ def ffmpeg_extract_audio(
     return result
 
 
-def ffprobe(path: Path, verbose: bool = False) -> dict[str, Any]:
+def ffprobe(path: Path) -> dict[str, Any]:
     """
     Run system's ``ffprobe`` binary against a media file and collect its output.
 
@@ -181,8 +165,6 @@ def ffprobe(path: Path, verbose: bool = False) -> dict[str, Any]:
     Args:
         path:
             Path to media file.
-        verbose:
-            Print subprocess command before running it.
 
     Raises:
         RuntimeError:
@@ -307,7 +289,8 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     """
     logger.info(' '.join([shlex.quote(arg) for arg in args]))
     try:
-        result = subprocess.run(args, capture_output=True, check=True, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=True, text=True, stdin=subprocess.DEVNULL)
     except FileNotFoundError:
         command = args[0]
         logger.error(f"Command '{command}' not found on system. Please install.")
@@ -320,7 +303,7 @@ def run(args: list[str]) -> subprocess.CompletedProcess[str]:
     return result
 
 
-@dataclass
+@dataclass(frozen=True)
 class Chapter:
     """
     Basic metadata on audiobook clips.
@@ -397,7 +380,7 @@ class Chapteriser:
         Returns:
             List of chapter instances.
         """
-        num_parts = round((self.duration / 60) / self.target_minutes)
+        num_parts = max(1, round((self.duration / 60) / self.target_minutes))
         seconds = self.duration / num_parts
 
         chapters = []
@@ -461,18 +444,16 @@ class Splitinator:
     """
     Split single-file audiobook into seperate files.
     """
-    def __init__(self, chapteriser: Chapteriser, start=1):
+    def __init__(self, chapteriser: Chapteriser):
         """
         Initialiser.
 
         Args:
             chapteriser:
                 Valid Chapteriser instance.
-            start:
-                Number to start counting from for file name prefixes.
         """
         self.chapters = chapteriser.chapterise()
-        self.start = start
+        self.start = chapteriser.start
         self.media_path = chapteriser.path
         self.folder = self.media_path.parent / self._make_foldername()
         max_index = (len(self.chapters) - 1) + self.start
@@ -487,13 +468,19 @@ class Splitinator:
 
     def create_clip(self, index: int, chapter: Chapter) -> str:
         """
-        Create a single audio clip into current folder.
+        Create a single audio clip in the output folder.
+
+        The clip is written to a ``.part`` file and atomically renamed on
+        success, so an interrupted run leaves partial clips clearly marked.
 
         Returns:
             Name of file that was created.
         """
         filename = self._make_filename(index, chapter)
-        ffmpeg_extract_audio(self.media_path, chapter.start, chapter.end, filename)
+        final = self.folder / filename
+        partial = final.with_name(final.name + '.part')
+        ffmpeg_extract_audio(self.media_path, chapter.start, chapter.end, partial)
+        partial.rename(final)
         return filename
 
     def create_folder(self) -> None:
@@ -511,7 +498,8 @@ class Splitinator:
 
         self.folder.mkdir()
 
-    def _calculate_padding(self, max_value: int) -> int:
+    @staticmethod
+    def _calculate_padding(max_value: int) -> int:
         """
         Calculate the width of padding required for file names.
 
@@ -572,6 +560,13 @@ def parse(arguments: list[str]) -> argparse.Namespace:
     description = "Break audio book into multiple files, one per chapter."
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
+        '-j', '--jobs',
+        action='store',
+        default=max(1, (os.cpu_count() or 2) // 2),
+        metavar='NUM',
+        type=int,
+        help="number of ffmpeg jobs to run in parallel (default: half of CPU cores)")
+    parser.add_argument(
         '-s', '--start',
         action='store',
         default=1,
@@ -586,6 +581,8 @@ def parse(arguments: list[str]) -> argparse.Namespace:
         help="assume yes; do not ask for confirmation")
     parser.add_argument('path', metavar='PATH', help='audio file to process')
     options = parser.parse_args()
+    if options.jobs < 1:
+        parser.error("--jobs must be at least 1")
     return options
 
 
@@ -630,7 +627,7 @@ def main(options: argparse.Namespace) -> int:
     try:
         path = Path(options.path).resolve()
         chapteriser = Chapteriser(path, options.start)
-        splitinator = Splitinator(chapteriser, options.start)
+        splitinator = Splitinator(chapteriser)
     except RuntimeError as e:
         rprint(e)
         sys.exit(1)
@@ -641,15 +638,40 @@ def main(options: argparse.Namespace) -> int:
 
     # Create folder, create split files
     num_chapters = len(splitinator.chapters)
+    jobs = min(options.jobs, num_chapters)
     try:
         splitinator.create_folder()
-        with change_folder(splitinator.folder):
-            for index, chapter in enumerate(splitinator.chapters):
-                filename = splitinator.create_clip(index, chapter)
-                rprint(f"[{index+1}/{num_chapters}] {filename}")
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+        )
+        description = f"Encoding ({jobs} job{'s' if jobs != 1 else ''})"
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(splitinator.create_clip, index, chapter)
+                for index, chapter in enumerate(splitinator.chapters)
+            ]
+            try:
+                with progress:
+                    task = progress.add_task(description, total=num_chapters)
+                    for future in as_completed(futures):
+                        future.result()
+                        progress.update(task, advance=1)
+            except KeyboardInterrupt:
+                for f in futures:
+                    f.cancel()
+                raise
     except RuntimeError as e:
         rprint(e)
         sys.exit(1)
+    except KeyboardInterrupt:
+        rprint("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
 
 
 if __name__ == '__main__':
