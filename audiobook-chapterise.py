@@ -180,10 +180,13 @@ def ffprobe(path: Path) -> dict[str, Any]:
         '-show_format',
     ]
 
-    data = {}
+    data: dict[str, Any] = {}
     try:
         result = run(args)
-        data = json.loads(result.stdout)
+        parsed = json.loads(result.stdout)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("ffprobe returned non-object JSON")
+        data = parsed
     except json.decoder.JSONDecodeError:
         message = f"Could not decode JSON output: {result.stdout!r}"
         logger.error(message)
