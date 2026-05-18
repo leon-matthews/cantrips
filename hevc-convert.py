@@ -5,11 +5,6 @@ HEVC Convert
 
 Recompress video files in place to HEVC using FFMPEG and libx265.
 
-TODO:
-    - Change FFMPEG arguments based on command line options.
-    - Fill implementation of secure_copy()
-
-
 2025-08-27
     Experimented with AV1 encoding, using the `libsvtav1` encoder. Underwhelming,
     but more experimentation/comparison needed:
@@ -123,7 +118,6 @@ def build_ffmpeg_args(
     else:
         builder.output_options += ['-c:a', 'copy']
 
-
     # Subtitles
     builder.output_options += [
         '-c:s', 'copy',
@@ -147,13 +141,10 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
             Folder to save partially encoded file into.
         options:
             Command-line options
-
-    Returns:
-        None
     """
     logger.info("START compressing HEVC MP4 video: %s", original.name)
 
-    # Recompress output original into temporary folder
+    # Recompress original into temporary folder
     output_name = original.with_suffix('.mp4').name
     output_video = temp_folder / output_name
     args = build_ffmpeg_args(original, output_video, options)
@@ -165,9 +156,11 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
     print(" ".join(args))
     print()
 
+    if options.dry_run:
+        return
+
     logger.info("Execute FFMPEG, output to: %s", output_video)
-    if not options.dry_run:
-        subprocess.run(args, check=True)
+    subprocess.run(args, check=True)
 
     dest = original.parent / output_name
     part = dest.with_name(dest.name + '.part')
@@ -220,7 +213,7 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
     # --dry-run, -n
     parser.add_argument(
         '-n', '--dry-run', action='store_true',
-        help='only show which files would be transfered',
+        help='show the ffmpeg command for each input without executing it',
     )
 
     # --stereo, -s
