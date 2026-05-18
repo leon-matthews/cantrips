@@ -25,7 +25,6 @@ TODO:
 import argparse
 import logging
 from pathlib import Path
-from pprint import pprint as pp
 import shutil
 import subprocess
 import sys
@@ -162,7 +161,6 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
     # Recompress output original into temporary folder
     output_name = original.with_suffix('.mp4').name
     output_video = temp_folder / output_name
-    builder = FFmpegArgumentBuilder(original, output_video)
     args = build_ffmpeg_args(original, output_video, options)
 
     print()
@@ -176,10 +174,10 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
     if not options.dry_run:
         subprocess.run(args, check=True)
 
-    # Copy new file into same folder (and maybe over top of) original file
-    shutil.copyfile(output_video, original.parent / output_name)
-
-    # Remove temp file
+    dest = original.parent / output_name
+    part = dest.with_name(dest.name + '.part')
+    shutil.copyfile(output_video, part)
+    part.replace(dest)
     output_video.unlink()
 
 
