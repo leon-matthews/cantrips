@@ -101,22 +101,17 @@ def build_ffmpeg_args(
         builder.output_options += ['-preset', 'slow', '-crf', '28']
 
     # Video filters
-    if options.scale_480:
-        builder.output_options += [
-            '-vf', "scale=w=-2:h='min(480,ih)'",
-        ]
-    if options.scale_720:
-        builder.output_options += [
-            '-vf', "scale=w=-2:h='min(720,ih)'",
-        ]
-    if options.scale_1080:
-        builder.output_options += [
-            '-vf', "scale=w=-2:h='min(1080,ih)'",
-        ]
+    filters = []
     if options.deinterlace:
-        builder.output_options += [
-            '-vf', 'bwdif=mode=send_field:parity=auto:deint=all',
-        ]
+        filters.append('bwdif=mode=send_field:parity=auto:deint=all')
+    if options.scale_480:
+        filters.append("scale=w=-2:h='min(480,ih)'")
+    elif options.scale_720:
+        filters.append("scale=w=-2:h='min(720,ih)'")
+    elif options.scale_1080:
+        filters.append("scale=w=-2:h='min(1080,ih)'")
+    if filters:
+        builder.output_options += ['-vf', ','.join(filters)]
 
     # Audio
     if options.stereo:
