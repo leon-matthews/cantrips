@@ -18,7 +18,6 @@ Recompress video files in place to HEVC using FFMPEG and libx265.
 """
 
 import argparse
-import logging
 from pathlib import Path
 import shutil
 import subprocess
@@ -34,9 +33,6 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-
-
-logger = logging.getLogger(__name__)
 
 
 class FFmpegArgumentBuilder:
@@ -255,7 +251,7 @@ def main(options: argparse.Namespace) -> int:
     with TemporaryDirectory(prefix='hevc-convert-') as temp_folder:
         for video in videos:
             if video.is_dir():
-                logger.info("Skipping folder: %s", video)
+                print(f"Skipping folder: {video}", file=sys.stderr)
                 continue
 
             hevc_convert(video, Path(temp_folder), options)
@@ -337,9 +333,5 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
 
 if __name__ == '__main__':
     options = parse_arguments(sys.argv[1:])
-    logging.basicConfig(
-        format='%(message)s',
-        level=logging.INFO,
-    )
     status = main(options)
     sys.exit(status)
