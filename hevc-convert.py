@@ -24,6 +24,16 @@ import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import threading
+
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +57,13 @@ class FFmpegArgumentBuilder:
         self.input_path = input_path
         self.output_options = []
         self.output_path = output_path
-        self.global_options = ['-hide_banner', '-nostdin']
+        self.global_options = [
+            '-hide_banner',
+            '-nostdin',
+            '-loglevel', 'error',
+            '-nostats',
+            '-progress', 'pipe:1',
+        ]
 
     def args(self) -> list[str]:
         args = ['ffmpeg'] + self.global_options
@@ -130,6 +146,75 @@ def build_ffmpeg_args(
     return builder.args()
 
 
+def ffprobe_duration(path: Path) -> float | None:
+    """
+    Return media duration in seconds, or None if unknown.
+    """
+    args = [
+        'ffprobe',
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        str(path),
+    ]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, check=True)
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+
+
+def run_ffmpeg_with_progress(args: list[str], description: str, total: float | None) -> None:
+    """
+    Run ffmpeg, parsing its ``-progress`` stream to drive a rich progress bar.
+
+    Raises:
+        subprocess.CalledProcessError:
+            On non-zero exit, with stderr attached.
+    """
+    columns = [
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ]
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout = proc.stdout
+    stderr = proc.stderr
+    assert stdout is not None and stderr is not None
+    stderr_buf: list[str] = []
+    stderr_thread = threading.Thread(target=lambda: stderr_buf.extend(stderr))
+    stderr_thread.start()
+
+    with Progress(*columns) as progress:
+        task = progress.add_task(description, total=total)
+        for line in stdout:
+            if line.startswith('out_time_us='):
+                value = line.split('=', 1)[1].strip()
+                if value.isdigit():
+                    progress.update(task, completed=int(value) / 1_000_000)
+        if total is not None:
+            progress.update(task, completed=total)
+
+    proc.wait()
+    stderr_thread.join()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, args, output=None, stderr=''.join(stderr_buf),
+        )
+
+
 def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace) -> None:
     """
     Convert video in-place.
@@ -142,25 +227,20 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
         options:
             Command-line options
     """
-    logger.info("START compressing HEVC MP4 video: %s", original.name)
-
-    # Recompress original into temporary folder
     output_name = original.with_suffix('.mp4').name
     output_video = temp_folder / output_name
     args = build_ffmpeg_args(original, output_video, options)
 
-    print()
-    print("="*80)
-    print(original.name)
-    print("="*80)
-    print(" ".join(args))
-    print()
-
     if options.dry_run:
+        print(' '.join(args))
         return
 
-    logger.info("Execute FFMPEG, output to: %s", output_video)
-    subprocess.run(args, check=True)
+    duration = ffprobe_duration(original)
+    try:
+        run_ffmpeg_with_progress(args, original.name, duration)
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(e.stderr or '')
+        raise
 
     dest = original.parent / output_name
     part = dest.with_name(dest.name + '.part')
