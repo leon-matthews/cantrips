@@ -161,6 +161,19 @@ def ffprobe_duration(path: Path) -> float | None:
         return None
 
 
+BAR_WIDTH = 40
+# Approximate width consumed by every column except the description:
+# percent (4) + separator (1) + elapsed (7) + separator (1) + remaining (7) + gaps (6).
+OTHER_COLUMNS_WIDTH = BAR_WIDTH + 26
+
+
+def _format_description(name: str, width: int) -> str:
+    """Truncate with an ellipsis or right-pad ``name`` so it occupies ``width`` chars."""
+    if len(name) > width:
+        return name[: width - 1] + '…'
+    return name.ljust(width)
+
+
 def run_ffmpeg_with_progress(args: list[str], description: str, total: float | None) -> None:
     """
     Run ffmpeg, parsing its ``-progress`` stream to drive a rich progress bar.
@@ -169,9 +182,12 @@ def run_ffmpeg_with_progress(args: list[str], description: str, total: float | N
         subprocess.CalledProcessError:
             On non-zero exit, with stderr attached.
     """
+    desc_width = max(10, shutil.get_terminal_size().columns - OTHER_COLUMNS_WIDTH)
+    description = _format_description(description, desc_width)
+
     columns = [
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
+        BarColumn(bar_width=BAR_WIDTH),
         TaskProgressColumn(),
         TextColumn("•"),
         TimeElapsedColumn(),
