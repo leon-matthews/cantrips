@@ -223,7 +223,8 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
         options:
             Command-line options
     """
-    output_name = original.with_suffix('.mp4').name
+    suffix = '.mkv' if options.mkv else '.mp4'
+    output_name = original.with_suffix(suffix).name
     output_video = temp_folder / output_name
     args = build_ffmpeg_args(original, output_video, options)
 
@@ -290,6 +291,12 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
     parser.add_argument(
         '-n', '--dry-run', action='store_true',
         help='show the ffmpeg command for each input without executing it',
+    )
+
+    # --mkv, -m
+    parser.add_argument(
+        '-m', '--mkv', action='store_true',
+        help="use '.mkv' as the output file extension instead of '.mp4'",
     )
 
     # --stereo, -s
