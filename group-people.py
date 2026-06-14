@@ -76,6 +76,7 @@ class Candidate:
     name: str               # Destination folder name, e.g. "John Smith".
     score: float            # Combined fuzzy score, 0-100.
     adjacent: bool          # Name tokens matched consecutive file tokens in order.
+    position: int           # Leftmost file-token index the name matched.
 
 
 @dataclass
@@ -175,14 +176,15 @@ def source_files(source: Path, show_all: bool) -> list[Path]:
     return files
 
 
-def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool]:
+def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool, int]:
     """
     Score how well the wanted name tokens appear among the file tokens.
 
     Each wanted token is greedily paired with its best unused file token. The
     returned score is the weakest such pairing, so every part of the name must be
     present for a high score. The boolean reports whether the matched tokens were
-    consecutive and in order.
+    consecutive and in order, and the integer is the leftmost file-token index the
+    name matched.
     """
     used: set[int] = set()
     positions: list[int] = []
@@ -205,7 +207,8 @@ def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool]:
     score = min(per_token) if per_token else 0.0
     adjacent = len(positions) >= 2 and all(p >= 0 for p in positions) and all(
         positions[i] + 1 == positions[i + 1] for i in range(len(positions) - 1))
-    return score, adjacent
+    start = min((p for p in positions if p >= 0), default=len(file_tokens))
+    return score, adjacent, start
 
 
 def build_index(names: list[str]) -> NameIndex:
@@ -245,6 +248,10 @@ def build_match(path: Path, index: NameIndex,
         min_score: float, auto_score: float) -> Match:
     """
     Resolve a single source file to its best destination match and tier.
+
+    When several confident names score almost equally, the one appearing earliest
+    in the filename wins; the match is only ambiguous when two such names share
+    that earliest position.
     """
     file_tokens = tokenize(path.stem)
     candidates = [
@@ -253,14 +260,16 @@ def build_match(path: Path, index: NameIndex,
     if not candidates:
         return Match(path=path, name=None, score=0.0, tier=Tier.NONE)
 
-    candidates.sort(key=lambda c: (c.score, c.adjacent), reverse=True)
-    top = candidates[0]
-    if top.score < min_score:
-        return Match(path=path, name=None, score=top.score, tier=Tier.NONE)
+    best_score = max(c.score for c in candidates)
+    if best_score < min_score:
+        return Match(path=path, name=None, score=best_score, tier=Tier.NONE)
 
-    runner_up = candidates[1].score if len(candidates) > 1 else 0.0
-    ambiguous = (runner_up >= min_score
-        and (top.score - runner_up) < AMBIGUITY_MARGIN)
+    contenders = [c for c in candidates
+        if c.score >= min_score and best_score - c.score < AMBIGUITY_MARGIN]
+    contenders.sort(key=lambda c: (c.position, not c.adjacent, -c.score))
+    top = contenders[0]
+
+    ambiguous = any(c is not top and c.position == top.position for c in contenders)
     if top.score >= auto_score and top.adjacent and not ambiguous:
         tier = Tier.AUTO
     else:
