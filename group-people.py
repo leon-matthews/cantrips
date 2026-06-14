@@ -15,6 +15,7 @@ that does not yet exist in the destination.
 from __future__ import annotations
 
 import argparse
+import errno
 import shutil
 import sys
 from dataclasses import dataclass
@@ -363,8 +364,9 @@ def confirm(question: str) -> bool:
 
 def move_file(path: Path, dest: Path, name: str) -> bool:
     """
-    Move a file into the destination's named subfolder.
+    Move a file into the destination's named subfolder, safely across filesystems.
 
+    An interrupted move never leaves a partially-written file under the final name.
     Returns False without moving if a file of the same name already exists there.
     """
     folder = dest / name
@@ -373,7 +375,15 @@ def move_file(path: Path, dest: Path, name: str) -> bool:
         warn(f"skipped (target exists): {target}")
         return False
     folder.mkdir(exist_ok=True)
-    shutil.move(str(path), str(target))
+    try:
+        path.rename(target)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        part = target.with_name(target.name + ".part")
+        shutil.copy2(path, part)
+        part.replace(target)
+        path.unlink()
     return True
 
 
@@ -475,20 +485,26 @@ def main() -> int:
     # moves stream out together instead of stalling on large sets.
     width = max((len(path.name) for path in files), default=0)
     moved = skipped = auto = ask = none = 0
-    for path in files:
-        match = build_match(path, index, min_score, auto_score)
-        print_match(match, width)
-        if match.tier is Tier.AUTO:
-            auto += 1
-        elif match.tier is Tier.CONFIRM:
-            ask += 1
-        else:
-            none += 1
-        if options.move and match.name is not None:
-            if move_match(match, dest, options.yes, options.no):
-                moved += 1
+    interrupted = False
+    try:
+        for path in files:
+            match = build_match(path, index, min_score, auto_score)
+            print_match(match, width)
+            if match.tier is Tier.AUTO:
+                auto += 1
+            elif match.tier is Tier.CONFIRM:
+                ask += 1
             else:
-                skipped += 1
+                none += 1
+            if options.move and match.name is not None:
+                if move_match(match, dest, options.yes, options.no):
+                    moved += 1
+                else:
+                    skipped += 1
+    except KeyboardInterrupt:
+        interrupted = True
+        print()
+        warn("interrupted; no file was left partially moved")
 
     if options.move:
         summary = f"moved {moved}, skipped {skipped}, {none} unmatched"
@@ -497,7 +513,7 @@ def main() -> int:
             f"({total} files) (DRY RUN)")
     print(colorama.Fore.YELLOW + summary + colorama.Style.RESET_ALL,
         file=sys.stderr)
-    return 0
+    return 130 if interrupted else 0
 
 
 if __name__ == "__main__":
