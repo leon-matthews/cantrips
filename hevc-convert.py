@@ -5,6 +5,11 @@ HEVC Convert
 
 Recompress video files in place to HEVC using FFMPEG and libx265.
 
+2026-06-15
+    TODO It might be time to try AV1 again. As a starting point:
+    ffmpeg -i input.mp4 -c:v libsvtav1 -preset 6 -crf 28 \
+        -svtav1-params tune=0:film-grain=8 -c:a copy output.mkv
+
 2025-08-27
     Experimented with AV1 encoding, using the `libsvtav1` encoder. Underwhelming,
     but more experimentation/comparison needed:
