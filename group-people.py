@@ -6,7 +6,7 @@ Move files whose names embed a person's name (e.g. '2024.john.smith.report.pdf')
 into a destination subfolder named in 'First Last' form. Names are matched against
 the folders already present in the destination: confident matches move
 automatically, borderline matches ask for confirmation. A dry run is performed
-unless --force is given.
+unless --move is given.
 
 The --suggest mode instead reports unmatched files grouped by a best-guess name
 that does not yet exist in the destination.
@@ -124,12 +124,16 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
     parser.add_argument("dest", type=Path,
         help="folder holding the tidy 'First Last' subfolders")
 
-    parser.add_argument("-f", "--force", action="store_true",
+    parser.add_argument("-m", "--move", action="store_true",
         help="actually move files (default: dry run)")
-    parser.add_argument("-y", "--yes", action="store_true",
-        help="auto-confirm borderline matches instead of prompting")
     parser.add_argument("-s", "--suggest", action="store_true",
         help="report unmatched files grouped by a guessed new name, then exit")
+
+    borderline = parser.add_mutually_exclusive_group()
+    borderline.add_argument("-y", "--yes", action="store_true",
+        help="move borderline matches without asking")
+    borderline.add_argument("-n", "--no", action="store_true",
+        help="skip borderline matches without asking")
     parser.add_argument("-a", "--all", action="store_true", dest="show_all",
         help="include hidden source files")
 
@@ -364,10 +368,13 @@ def move_file(path: Path, dest: Path, name: str) -> bool:
     return True
 
 
-def execute(matches: list[Match], dest: Path, assume_yes: bool) -> tuple[int, int]:
+def execute(matches: list[Match], dest: Path,
+        assume_yes: bool, assume_no: bool) -> tuple[int, int]:
     """
     Carry out the planned moves, prompting on borderline matches.
 
+    Borderline matches are moved without asking when assume_yes is set, skipped
+    without asking when assume_no is set, and otherwise confirmed interactively.
     Returns a (moved, skipped) count pair.
     """
     moved = skipped = 0
@@ -375,7 +382,7 @@ def execute(matches: list[Match], dest: Path, assume_yes: bool) -> tuple[int, in
         if match.name is None:
             continue
         if match.tier is Tier.CONFIRM and not assume_yes:
-            if not confirm(f"Move {match.path.name!r} into {match.name!r}?"):
+            if assume_no or not confirm(f"Move {match.path.name!r} into {match.name!r}?"):
                 skipped += 1
                 continue
         if move_file(match.path, dest, match.name):
@@ -471,8 +478,8 @@ def main() -> int:
     ask = sum(1 for m in matches if m.tier is Tier.CONFIRM)
     none = sum(1 for m in matches if m.tier is Tier.NONE)
 
-    if options.force:
-        moved, skipped = execute(matches, dest, options.yes)
+    if options.move:
+        moved, skipped = execute(matches, dest, options.yes, options.no)
         summary = f"moved {moved}, skipped {skipped}, {none} unmatched"
     else:
         summary = (f"{auto} to move, {ask} to confirm, {none} unmatched "
