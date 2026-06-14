@@ -368,28 +368,22 @@ def move_file(path: Path, dest: Path, name: str) -> bool:
     return True
 
 
-def execute(matches: list[Match], dest: Path,
-        assume_yes: bool, assume_no: bool) -> tuple[int, int]:
+def move_match(match: Match, dest: Path,
+        assume_yes: bool, assume_no: bool) -> bool:
     """
-    Carry out the planned moves, prompting on borderline matches.
+    Carry out one planned move, prompting on or skipping a borderline match.
 
-    Borderline matches are moved without asking when assume_yes is set, skipped
+    A borderline match is moved without asking when assume_yes is set, skipped
     without asking when assume_no is set, and otherwise confirmed interactively.
-    Returns a (moved, skipped) count pair.
+    Returns True when the file is moved, False when it is skipped or unmatched.
     """
-    moved = skipped = 0
-    for match in matches:
-        if match.name is None:
-            continue
-        if match.tier is Tier.CONFIRM and not assume_yes:
-            if assume_no or not confirm(f"Move {match.path.name!r} into {match.name!r}?"):
-                skipped += 1
-                continue
-        if move_file(match.path, dest, match.name):
-            moved += 1
-        else:
-            skipped += 1
-    return moved, skipped
+    name = match.name
+    if name is None:
+        return False
+    if match.tier is Tier.CONFIRM and not assume_yes:
+        if assume_no or not confirm(f"Move {match.path.name!r} into {name!r}?"):
+            return False
+    return move_file(match.path, dest, name)
 
 
 def run_suggest(matches: list[Match], names: list[str]) -> int:
@@ -466,24 +460,30 @@ def main() -> int:
     if not names:
         warn(f"no name folders found in {dest}; try --suggest")
 
-    # Match and print each file as we go, so output streams rather than stalling.
+    # Match, print, and (when moving) act on each file in turn, so output and
+    # moves stream out together instead of stalling on large sets.
     width = max((len(path.name) for path in files), default=0)
-    matches: list[Match] = []
+    moved = skipped = auto = ask = none = 0
     for path in files:
         match = build_match(path, index, min_score, auto_score)
         print_match(match, width)
-        matches.append(match)
-
-    auto = sum(1 for m in matches if m.tier is Tier.AUTO)
-    ask = sum(1 for m in matches if m.tier is Tier.CONFIRM)
-    none = sum(1 for m in matches if m.tier is Tier.NONE)
+        if match.tier is Tier.AUTO:
+            auto += 1
+        elif match.tier is Tier.CONFIRM:
+            ask += 1
+        else:
+            none += 1
+        if options.move and match.name is not None:
+            if move_match(match, dest, options.yes, options.no):
+                moved += 1
+            else:
+                skipped += 1
 
     if options.move:
-        moved, skipped = execute(matches, dest, options.yes, options.no)
         summary = f"moved {moved}, skipped {skipped}, {none} unmatched"
     else:
         summary = (f"{auto} to move, {ask} to confirm, {none} unmatched "
-            f"({len(files)} files) (DRY RUN)")
+            f"({total} files) (DRY RUN)")
     print(colorama.Fore.YELLOW + summary + colorama.Style.RESET_ALL,
         file=sys.stderr)
     return 0
