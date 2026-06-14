@@ -405,8 +405,10 @@ def run_suggest(matches: list[Match], names: list[str]) -> int:
 
     if groups:
         print("Suggested new folders (not yet in the destination):\n")
-        for name in sorted(groups):
-            print(colorama.Fore.CYAN + name + colorama.Style.RESET_ALL)
+        # Fewest matches first so the names with the most files end up last.
+        for name in sorted(groups, key=lambda n: (len(groups[n]), n)):
+            print(colorama.Fore.CYAN + f"{name} ({len(groups[name])})"
+                + colorama.Style.RESET_ALL)
             for path in groups[name]:
                 print(f"    {path.name}")
         print()
