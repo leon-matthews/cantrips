@@ -43,6 +43,9 @@ DEFAULT_MIN_SCORE = 80.0
 # A clear winner must beat the runner-up name by this margin to move on its own.
 AMBIGUITY_MARGIN = 4.0
 
+# Token prefix length used to block names for fuzzy candidate generation.
+PREFIX_LEN = 3
+
 # Splits a name into its lowercase alphanumeric parts.
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -93,6 +96,20 @@ class Vocabulary:
     """
     firsts: frozenset[str]  # Leading tokens, e.g. "john" from "John Smith".
     lasts: frozenset[str]   # Trailing tokens, e.g. "smith" from "John Smith".
+
+
+@dataclass(frozen=True)
+class NameIndex:
+    """
+    Destination names with lookup tables that narrow matching to a few candidates.
+
+    Without this every file would be scored against every name; instead each file
+    only scores names that share an exact token or a token prefix with it.
+    """
+    names: list[str]                    # Destination folder names.
+    tokens: list[list[str]]             # Tokenised names, parallel to `names`.
+    by_exact: dict[str, list[int]]      # Token -> indices of names using it.
+    by_prefix: dict[str, list[int]]     # Token prefix -> indices of names using it.
 
 
 def parse_arguments(args: list[str]) -> argparse.Namespace:
@@ -187,45 +204,64 @@ def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool]:
     return score, adjacent
 
 
-def classify(file_tokens: list[str], names: list[str],
-        min_score: float, auto_score: float) -> Match | None:
+def build_index(names: list[str]) -> NameIndex:
     """
-    Pick the best destination name for a file and its confidence tier.
+    Tokenise the destination names once and index them for candidate lookup.
 
-    Returns None when there are no destination names to match against.
+    Each name is keyed by its first and last token, both exactly and by prefix,
+    so a file can find the few names worth scoring without a full scan.
     """
-    if not names:
-        return None
+    tokens = [tokenize(name) for name in names]
+    by_exact: dict[str, list[int]] = {}
+    by_prefix: dict[str, list[int]] = {}
+    for index, parts in enumerate(tokens):
+        if not parts:
+            continue
+        for token in {parts[0], parts[-1]}:
+            by_exact.setdefault(token, []).append(index)
+            by_prefix.setdefault(token[:PREFIX_LEN], []).append(index)
+    return NameIndex(names, tokens, by_exact, by_prefix)
 
-    candidates = [Candidate(name, *score_name(file_tokens, tokenize(name)))
-        for name in names]
+
+def candidates_for(file_tokens: list[str], index: NameIndex) -> set[int]:
+    """
+    Return the indices of names sharing an exact token or prefix with the file.
+
+    These are the only names worth scoring; a name with no shared token cannot
+    reach the match threshold (barring a typo in both of its parts).
+    """
+    found: set[int] = set()
+    for token in set(file_tokens):
+        found.update(index.by_exact.get(token, ()))
+        found.update(index.by_prefix.get(token[:PREFIX_LEN], ()))
+    return found
+
+
+def build_match(path: Path, index: NameIndex,
+        min_score: float, auto_score: float) -> Match:
+    """
+    Resolve a single source file to its best destination match and tier.
+    """
+    file_tokens = tokenize(path.stem)
+    candidates = [
+        Candidate(index.names[i], *score_name(file_tokens, index.tokens[i]))
+        for i in candidates_for(file_tokens, index)]
+    if not candidates:
+        return Match(path=path, name=None, score=0.0, tier=Tier.NONE)
+
     candidates.sort(key=lambda c: (c.score, c.adjacent), reverse=True)
     top = candidates[0]
-
     if top.score < min_score:
-        return Match(path=Path(), name=None, score=top.score, tier=Tier.NONE)
+        return Match(path=path, name=None, score=top.score, tier=Tier.NONE)
 
     runner_up = candidates[1].score if len(candidates) > 1 else 0.0
     ambiguous = (runner_up >= min_score
         and (top.score - runner_up) < AMBIGUITY_MARGIN)
-
     if top.score >= auto_score and top.adjacent and not ambiguous:
         tier = Tier.AUTO
     else:
         tier = Tier.CONFIRM
-    return Match(path=Path(), name=top.name, score=top.score, tier=tier)
-
-
-def build_match(path: Path, names: list[str],
-        min_score: float, auto_score: float) -> Match:
-    """
-    Resolve a single source file to its best destination match.
-    """
-    result = classify(tokenize(path.stem), names, min_score, auto_score)
-    if result is None:
-        return Match(path=path, name=None, score=0.0, tier=Tier.NONE)
-    result.path = path
-    return result
+    return Match(path=path, name=top.name, score=top.score, tier=tier)
 
 
 def build_vocabulary(names: list[str]) -> Vocabulary:
@@ -287,20 +323,18 @@ def colour_for(tier: Tier) -> str:
     return colours[tier]
 
 
-def preview(matches: list[Match]) -> None:
+def print_match(match: Match, width: int) -> None:
     """
-    Print every planned action, one colour-coded line per source file.
+    Print one colour-coded line describing the planned action for a file.
     """
-    width = max((len(m.path.name) for m in matches), default=0)
-    for match in matches:
-        name = match.path.name.ljust(width)
-        if match.tier is Tier.AUTO:
-            body = f"move  {name}  ->  {match.name}/   ({match.score:.0f})"
-        elif match.tier is Tier.CONFIRM:
-            body = f"ask   {name}  ->  {match.name}?   ({match.score:.0f})"
-        else:
-            body = f"--    {name}  (no match)"
-        print(colour_for(match.tier) + body + colorama.Style.RESET_ALL)
+    name = match.path.name.ljust(width)
+    if match.tier is Tier.AUTO:
+        body = f"move  {name}  ->  {match.name}/   ({match.score:.0f})"
+    elif match.tier is Tier.CONFIRM:
+        body = f"ask   {name}  ->  {match.name}?   ({match.score:.0f})"
+    else:
+        body = f"--    {name}  (no match)"
+    print(colour_for(match.tier) + body + colorama.Style.RESET_ALL)
 
 
 def confirm(question: str) -> bool:
@@ -408,17 +442,30 @@ def main() -> int:
 
     colorama.init()
     names = known_names(dest)
+    index = build_index(names)
     files = source_files(source, options.show_all)
-    matches = [build_match(f, names, options.min_score, options.auto_score)
-        for f in files]
+    min_score: float = options.min_score
+    auto_score: float = options.auto_score
+    total = len(files)
 
     if options.suggest:
-        return run_suggest(matches, names)
+        suggest_matches: list[Match] = []
+        for number, path in enumerate(files, start=1):
+            suggest_matches.append(build_match(path, index, min_score, auto_score))
+            if number % 1000 == 0:
+                print(f"  scanned {number}/{total}...", file=sys.stderr)
+        return run_suggest(suggest_matches, names)
 
     if not names:
         warn(f"no name folders found in {dest}; try --suggest")
 
-    preview(matches)
+    # Match and print each file as we go, so output streams rather than stalling.
+    width = max((len(path.name) for path in files), default=0)
+    matches: list[Match] = []
+    for path in files:
+        match = build_match(path, index, min_score, auto_score)
+        print_match(match, width)
+        matches.append(match)
 
     auto = sum(1 for m in matches if m.tier is Tier.AUTO)
     ask = sum(1 for m in matches if m.tier is Tier.CONFIRM)
