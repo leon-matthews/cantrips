@@ -138,6 +138,8 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         help="skip borderline matches without asking")
     parser.add_argument("-a", "--all", action="store_true", dest="show_all",
         help="include hidden source files")
+    parser.add_argument("--overwrite", action="store_true",
+        help="replace existing destination files instead of skipping them")
 
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
         metavar="N", help=f"score (0-100) below which there is no match "
@@ -337,7 +339,7 @@ def colour_for(tier: Tier) -> str:
     return colours[tier]
 
 
-def print_match(match: Match, width: int) -> None:
+def print_match(match: Match, width: int, replacing: bool = False) -> None:
     """
     Print one colour-coded line describing the planned action for a file.
     """
@@ -348,7 +350,10 @@ def print_match(match: Match, width: int) -> None:
         body = f"ask   {name}  ->  {match.name}?   ({match.score:.0f})"
     else:
         body = f"--    {name}  (no match)"
-    print(colour_for(match.tier) + body + colorama.Style.RESET_ALL)
+    if replacing:
+        body += "  [replaces existing]"
+    colour = colorama.Fore.RED if replacing else colour_for(match.tier)
+    print(colour + body + colorama.Style.RESET_ALL)
 
 
 def confirm(question: str) -> bool:
@@ -362,33 +367,38 @@ def confirm(question: str) -> bool:
     return answer in {"y", "yes"}
 
 
-def move_file(path: Path, dest: Path, name: str) -> bool:
+def move_file(path: Path, dest: Path, name: str, overwrite: bool = False) -> bool:
     """
     Move a file into the destination's named subfolder, safely across filesystems.
 
-    An interrupted move never leaves a partially-written file under the final name.
-    Returns False without moving if a file of the same name already exists there.
+    An interrupted move leaves no partial file under the final name and no leftover
+    temporary. Returns False without moving if a file of the same name already
+    exists there, unless overwrite is set.
     """
     folder = dest / name
     target = folder / path.name
-    if target.exists():
+    if target.exists() and not overwrite:
         warn(f"skipped (target exists): {target}")
         return False
     folder.mkdir(exist_ok=True)
     try:
-        path.rename(target)
+        path.replace(target)
     except OSError as error:
         if error.errno != errno.EXDEV:
             raise
         part = target.with_name(target.name + ".part")
-        shutil.copy2(path, part)
-        part.replace(target)
+        try:
+            shutil.copy2(path, part)
+            part.replace(target)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
         path.unlink()
     return True
 
 
 def move_match(match: Match, dest: Path,
-        assume_yes: bool, assume_no: bool) -> bool:
+        assume_yes: bool, assume_no: bool, overwrite: bool = False) -> bool:
     """
     Carry out one planned move, prompting on or skipping a borderline match.
 
@@ -402,7 +412,7 @@ def move_match(match: Match, dest: Path,
     if match.tier is Tier.CONFIRM and not assume_yes:
         if assume_no or not confirm(f"Move {match.path.name!r} into {name!r}?"):
             return False
-    return move_file(match.path, dest, name)
+    return move_file(match.path, dest, name, overwrite)
 
 
 def run_suggest(matches: list[Match], names: list[str]) -> int:
@@ -484,12 +494,14 @@ def main() -> int:
     # Match, print, and (when moving) act on each file in turn, so output and
     # moves stream out together instead of stalling on large sets.
     width = max((len(path.name) for path in files), default=0)
-    moved = skipped = auto = ask = none = 0
+    moved = skipped = replaced = auto = ask = none = 0
     interrupted = False
     try:
         for path in files:
             match = build_match(path, index, min_score, auto_score)
-            print_match(match, width)
+            replacing = (options.overwrite and match.name is not None
+                and (dest / match.name / path.name).exists())
+            print_match(match, width, replacing)
             if match.tier is Tier.AUTO:
                 auto += 1
             elif match.tier is Tier.CONFIRM:
@@ -497,8 +509,10 @@ def main() -> int:
             else:
                 none += 1
             if options.move and match.name is not None:
-                if move_match(match, dest, options.yes, options.no):
+                if move_match(match, dest, options.yes, options.no, options.overwrite):
                     moved += 1
+                    if replacing:
+                        replaced += 1
                 else:
                     skipped += 1
     except KeyboardInterrupt:
@@ -508,6 +522,8 @@ def main() -> int:
 
     if options.move:
         summary = f"moved {moved}, skipped {skipped}, {none} unmatched"
+        if options.overwrite:
+            summary += f" ({replaced} replaced)"
     else:
         summary = (f"{auto} to move, {ask} to confirm, {none} unmatched "
             f"({total} files) (DRY RUN)")
