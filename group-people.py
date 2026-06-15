@@ -17,6 +17,7 @@ skipped while guessing names.
 from __future__ import annotations
 
 import argparse
+import errno
 import shutil
 import sys
 from dataclasses import dataclass
@@ -78,6 +79,7 @@ class Candidate:
     name: str               # Destination folder name, e.g. "John Smith".
     score: float            # Combined fuzzy score, 0-100.
     adjacent: bool          # Name tokens matched consecutive file tokens in order.
+    position: int           # Leftmost file-token index the name matched.
 
 
 @dataclass
@@ -141,6 +143,8 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         help="skip borderline matches without asking")
     parser.add_argument("-a", "--all", action="store_true", dest="show_all",
         help="include hidden source files")
+    parser.add_argument("--overwrite", action="store_true",
+        help="replace existing destination files instead of skipping them")
 
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
         metavar="N", help=f"score (0-100) below which there is no match "
@@ -200,14 +204,15 @@ def load_noise_tokens(path: Path) -> frozenset[str]:
     return frozenset(tokens)
 
 
-def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool]:
+def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool, int]:
     """
     Score how well the wanted name tokens appear among the file tokens.
 
     Each wanted token is greedily paired with its best unused file token. The
     returned score is the weakest such pairing, so every part of the name must be
     present for a high score. The boolean reports whether the matched tokens were
-    consecutive and in order.
+    consecutive and in order, and the integer is the leftmost file-token index the
+    name matched.
     """
     used: set[int] = set()
     positions: list[int] = []
@@ -230,7 +235,8 @@ def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool]:
     score = min(per_token) if per_token else 0.0
     adjacent = len(positions) >= 2 and all(p >= 0 for p in positions) and all(
         positions[i] + 1 == positions[i + 1] for i in range(len(positions) - 1))
-    return score, adjacent
+    start = min((p for p in positions if p >= 0), default=len(file_tokens))
+    return score, adjacent, start
 
 
 def build_index(names: list[str]) -> NameIndex:
@@ -270,6 +276,10 @@ def build_match(path: Path, index: NameIndex,
         min_score: float, auto_score: float) -> Match:
     """
     Resolve a single source file to its best destination match and tier.
+
+    When several confident names score almost equally, the one appearing earliest
+    in the filename wins; the match is only ambiguous when two such names share
+    that earliest position.
     """
     file_tokens = tokenize(path.stem)
     candidates = [
@@ -278,14 +288,16 @@ def build_match(path: Path, index: NameIndex,
     if not candidates:
         return Match(path=path, name=None, score=0.0, tier=Tier.NONE)
 
-    candidates.sort(key=lambda c: (c.score, c.adjacent), reverse=True)
-    top = candidates[0]
-    if top.score < min_score:
-        return Match(path=path, name=None, score=top.score, tier=Tier.NONE)
+    best_score = max(c.score for c in candidates)
+    if best_score < min_score:
+        return Match(path=path, name=None, score=best_score, tier=Tier.NONE)
 
-    runner_up = candidates[1].score if len(candidates) > 1 else 0.0
-    ambiguous = (runner_up >= min_score
-        and (top.score - runner_up) < AMBIGUITY_MARGIN)
+    contenders = [c for c in candidates
+        if c.score >= min_score and best_score - c.score < AMBIGUITY_MARGIN]
+    contenders.sort(key=lambda c: (c.position, not c.adjacent, -c.score))
+    top = contenders[0]
+
+    ambiguous = any(c is not top and c.position == top.position for c in contenders)
     if top.score >= auto_score and top.adjacent and not ambiguous:
         tier = Tier.AUTO
     else:
@@ -353,7 +365,7 @@ def colour_for(tier: Tier) -> str:
     return colours[tier]
 
 
-def print_match(match: Match, width: int) -> None:
+def print_match(match: Match, width: int, replacing: bool = False) -> None:
     """
     Print one colour-coded line describing the planned action for a file.
     """
@@ -364,7 +376,10 @@ def print_match(match: Match, width: int) -> None:
         body = f"ask   {name}  ->  {match.name}?   ({match.score:.0f})"
     else:
         body = f"--    {name}  (no match)"
-    print(colour_for(match.tier) + body + colorama.Style.RESET_ALL)
+    if replacing:
+        body += "  [replaces existing]"
+    colour = colorama.Fore.RED if replacing else colour_for(match.tier)
+    print(colour + body + colorama.Style.RESET_ALL)
 
 
 def confirm(question: str) -> bool:
@@ -378,24 +393,38 @@ def confirm(question: str) -> bool:
     return answer in {"y", "yes"}
 
 
-def move_file(path: Path, dest: Path, name: str) -> bool:
+def move_file(path: Path, dest: Path, name: str, overwrite: bool = False) -> bool:
     """
-    Move a file into the destination's named subfolder.
+    Move a file into the destination's named subfolder, safely across filesystems.
 
-    Returns False without moving if a file of the same name already exists there.
+    An interrupted move leaves no partial file under the final name and no leftover
+    temporary. Returns False without moving if a file of the same name already
+    exists there, unless overwrite is set.
     """
     folder = dest / name
     target = folder / path.name
-    if target.exists():
+    if target.exists() and not overwrite:
         warn(f"skipped (target exists): {target}")
         return False
     folder.mkdir(exist_ok=True)
-    shutil.move(str(path), str(target))
+    try:
+        path.replace(target)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        part = target.with_name(target.name + ".part")
+        try:
+            shutil.copy2(path, part)
+            part.replace(target)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        path.unlink()
     return True
 
 
 def move_match(match: Match, dest: Path,
-        assume_yes: bool, assume_no: bool) -> bool:
+        assume_yes: bool, assume_no: bool, overwrite: bool = False) -> bool:
     """
     Carry out one planned move, prompting on or skipping a borderline match.
 
@@ -409,7 +438,7 @@ def move_match(match: Match, dest: Path,
     if match.tier is Tier.CONFIRM and not assume_yes:
         if assume_no or not confirm(f"Move {match.path.name!r} into {name!r}?"):
             return False
-    return move_file(match.path, dest, name)
+    return move_file(match.path, dest, name, overwrite)
 
 
 def run_noise(files: list[Path], noise: frozenset[str]) -> int:
@@ -526,30 +555,42 @@ def main() -> int:
     # Match, print, and (when moving) act on each file in turn, so output and
     # moves stream out together instead of stalling on large sets.
     width = max((len(path.name) for path in files), default=0)
-    moved = skipped = auto = ask = none = 0
-    for path in files:
-        match = build_match(path, index, min_score, auto_score)
-        print_match(match, width)
-        if match.tier is Tier.AUTO:
-            auto += 1
-        elif match.tier is Tier.CONFIRM:
-            ask += 1
-        else:
-            none += 1
-        if options.move and match.name is not None:
-            if move_match(match, dest, options.yes, options.no):
-                moved += 1
+    moved = skipped = replaced = auto = ask = none = 0
+    interrupted = False
+    try:
+        for path in files:
+            match = build_match(path, index, min_score, auto_score)
+            replacing = (options.overwrite and match.name is not None
+                and (dest / match.name / path.name).exists())
+            print_match(match, width, replacing)
+            if match.tier is Tier.AUTO:
+                auto += 1
+            elif match.tier is Tier.CONFIRM:
+                ask += 1
             else:
-                skipped += 1
+                none += 1
+            if options.move and match.name is not None:
+                if move_match(match, dest, options.yes, options.no, options.overwrite):
+                    moved += 1
+                    if replacing:
+                        replaced += 1
+                else:
+                    skipped += 1
+    except KeyboardInterrupt:
+        interrupted = True
+        print()
+        warn("interrupted; no file was left partially moved")
 
     if options.move:
         summary = f"moved {moved}, skipped {skipped}, {none} unmatched"
+        if options.overwrite:
+            summary += f" ({replaced} replaced)"
     else:
         summary = (f"{auto} to move, {ask} to confirm, {none} unmatched "
             f"({total} files) (DRY RUN)")
     print(colorama.Fore.YELLOW + summary + colorama.Style.RESET_ALL,
         file=sys.stderr)
-    return 0
+    return 130 if interrupted else 0
 
 
 if __name__ == "__main__":
