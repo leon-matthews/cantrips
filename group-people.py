@@ -103,6 +103,15 @@ class Vocabulary:
 
 
 @dataclass(frozen=True)
+class Corpus:
+    """
+    File counts of tokens and adjacent token pairs across the source filenames.
+    """
+    token_df: dict[str, int]                # Token -> number of files holding it.
+    pair_df: dict[tuple[str, str], int]     # Adjacent pair -> number of files.
+
+
+@dataclass(frozen=True)
 class NameIndex:
     """
     Destination names with lookup tables that narrow matching to a few candidates.
@@ -161,6 +170,21 @@ def tokenize(text: str) -> list[str]:
     Return the lowercase alphanumeric tokens of a string.
     """
     return TOKEN_RE.findall(text.lower())
+
+
+def name_tokens(stem: str, noise: frozenset[str]) -> list[str]:
+    """
+    Tokenise a filename stem, dropping years, bare numbers, and noise words.
+    """
+    return [t for t in tokenize(stem) if len(t) >= 2
+        and not t.isdigit() and not YEAR_RE.match(t) and t not in noise]
+
+
+def name_pairs(tokens: list[str]) -> list[tuple[str, str]]:
+    """
+    Return the adjacent token pairs whose tokens are both alphabetic.
+    """
+    return [(a, b) for a, b in zip(tokens, tokens[1:]) if a.isalpha() and b.isalpha()]
 
 
 def known_names(dest: Path) -> list[str]:
@@ -319,24 +343,62 @@ def build_vocabulary(names: list[str]) -> Vocabulary:
     return Vocabulary(frozenset(firsts), frozenset(lasts))
 
 
+def build_corpus(files: list[Path], noise: frozenset[str]) -> Corpus:
+    """
+    Count how many files each token and each adjacent pair appears in.
+
+    Counting once per file makes a recurring name pair stand out: a person's name
+    appears across all of their files while the surrounding cruft varies.
+    """
+    token_df: dict[str, int] = {}
+    pair_df: dict[tuple[str, str], int] = {}
+    for path in files:
+        tokens = name_tokens(path.stem, noise)
+        for token in set(tokens):
+            token_df[token] = token_df.get(token, 0) + 1
+        for pair in set(name_pairs(tokens)):
+            pair_df[pair] = pair_df.get(pair, 0) + 1
+    return Corpus(token_df, pair_df)
+
+
+def exclusive_pair(pairs: list[tuple[str, str]], corpus: Corpus) -> tuple[str, str]:
+    """
+    Pick the pair whose tokens most exclusively co-occur across the source files.
+
+    A pair scores its file count over the commoner token's file count, so a
+    recurring name unit beats a cruft word whose partner also turns up elsewhere.
+    The earliest pair wins ties.
+    """
+    best = -1.0
+    chosen = pairs[0]
+    for left, right in pairs:
+        denom = max(corpus.token_df.get(left, 1), corpus.token_df.get(right, 1))
+        score = corpus.pair_df.get((left, right), 0) / denom
+        if score > best:                # Strict, so the earliest pair wins ties.
+            best = score
+            chosen = left, right
+    return chosen
+
+
 def guess_name(stem: str, vocab: Vocabulary | None = None,
-        noise: frozenset[str] = frozenset()) -> str | None:
+        noise: frozenset[str] = frozenset(),
+        corpus: Corpus | None = None) -> str | None:
     """
     Best-guess a 'First Last' name from a filename, or None if none looks likely.
 
     Years, bare numbers, single characters, and common cruft are dropped to leave
     candidate adjacent token pairs. Given a vocabulary, the pair whose tokens best
     fit known first/last name positions wins, and an apparently reversed
-    'Last First' pair is flipped; otherwise the first pair is taken. The earliest
-    pair wins ties, so a leading noise word never displaces a real name.
+    'Last First' pair is flipped. When no name part is known, a corpus picks the
+    pair whose tokens most exclusively co-occur across the source files rather than
+    the leading pair. The earliest pair wins ties.
     """
-    tokens = [t for t in tokenize(stem) if len(t) >= 2
-        and not t.isdigit() and not YEAR_RE.match(t) and t not in noise]
-    pairs = [(a, b) for a, b in zip(tokens, tokens[1:]) if a.isalpha() and b.isalpha()]
+    tokens = name_tokens(stem, noise)
+    pairs = name_pairs(tokens)
     if not pairs:
         return None
 
-    best_score = -1
+    vocab_score = -1
     first, last = pairs[0]
     if vocab is not None:
         for left, right in pairs:
@@ -347,9 +409,13 @@ def guess_name(stem: str, vocab: Vocabulary | None = None,
                 score, ordered = reverse, (right, left)
             else:
                 score, ordered = forward, (left, right)
-            if score > best_score:      # Strict, so the earliest pair wins ties.
-                best_score = score
+            if score > vocab_score:     # Strict, so the earliest pair wins ties.
+                vocab_score = score
                 first, last = ordered
+
+    # With no known name part, recurrence across files beats filename position.
+    if vocab_score < 1 and corpus is not None:
+        first, last = exclusive_pair(pairs, corpus)
     return f"{first.title()} {last.title()}"
 
 
@@ -451,8 +517,7 @@ def run_noise(files: list[Path], noise: frozenset[str]) -> int:
     """
     counts: dict[str, int] = {}
     for path in files:
-        for token in {t for t in tokenize(path.stem) if len(t) >= 2
-                and not t.isdigit() and not YEAR_RE.match(t) and t not in noise}:
+        for token in set(name_tokens(path.stem, noise)):
             counts[token] = counts.get(token, 0) + 1
 
     if not counts:
@@ -477,12 +542,13 @@ def run_suggest(matches: list[Match], names: list[str],
     """
     existing = {name.lower() for name in names}
     vocab = build_vocabulary(names)
+    corpus = build_corpus([match.path for match in matches], noise)
     groups: dict[str, list[Path]] = {}
     no_guess: list[Path] = []
     for match in matches:
         if match.tier is not Tier.NONE:
             continue
-        guess = guess_name(match.path.stem, vocab, noise)
+        guess = guess_name(match.path.stem, vocab, noise, corpus)
         if guess is None or guess.lower() in existing:
             no_guess.append(match.path)
             continue
