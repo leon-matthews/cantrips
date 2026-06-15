@@ -142,8 +142,8 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
     parser.add_argument("-s", "--suggest", action="store_true",
         help="report unmatched files grouped by a guessed new name, then exit")
     parser.add_argument("--noise", action="store_true",
-        help=f"list the most common filename tokens not in {NOISE_FILENAME}, "
-        "then exit")
+        help=f"list the most common filename tokens not in {NOISE_FILENAME} "
+        f"(use --noise=N for the top N, default {TOP_TOKENS}), then exit")
 
     borderline = parser.add_mutually_exclusive_group()
     borderline.add_argument("-y", "--yes", action="store_true",
@@ -162,7 +162,24 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         metavar="N", help=f"score (0-100) at/above which an adjacent match moves "
         f"automatically (default: {DEFAULT_AUTO_SCORE:g})")
 
-    return parser.parse_args(args)
+    # --noise carries an optional attached count (--noise=N); pull it out before
+    # parsing so a following source path is never mistaken for the count.
+    noise_count = TOP_TOKENS
+    scrubbed: list[str] = []
+    for arg in args:
+        if arg.startswith("--noise="):
+            value = arg.removeprefix("--noise=")
+            if not value.isdigit():
+                parser.error(f"--noise count must be a non-negative integer, "
+                    f"not {value!r}")
+            noise_count = int(value)
+            scrubbed.append("--noise")
+        else:
+            scrubbed.append(arg)
+
+    namespace = parser.parse_args(scrubbed)
+    namespace.noise_count = noise_count
+    return namespace
 
 
 def tokenize(text: str) -> list[str]:
@@ -507,13 +524,15 @@ def move_match(match: Match, dest: Path,
     return move_file(match.path, dest, name, overwrite)
 
 
-def run_noise(files: list[Path], noise: frozenset[str]) -> int:
+def run_noise(files: list[Path], noise: frozenset[str], limit: int) -> int:
     """
     List the most common filename tokens not already in the noise list.
 
     Tokens are counted once per file, so the ranking reflects how many files use
     each word; cruft shared across many files rises to the top while names stay
-    rare. Years, bare numbers, and single characters are left out.
+    rare. Years, bare numbers, and single characters are left out. The bare tokens
+    print to stdout ready to paste into the noise file, with the file count shown
+    as a strippable comment on the first and last entries only.
     """
     counts: dict[str, int] = {}
     for path in files:
@@ -521,17 +540,16 @@ def run_noise(files: list[Path], noise: frozenset[str]) -> int:
             counts[token] = counts.get(token, 0) + 1
 
     if not counts:
-        print(f"No candidate tokens found in {len(files)} file(s).")
+        print(f"no candidate tokens found in {len(files)} file(s)", file=sys.stderr)
         return 0
 
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_TOKENS]
-    print(f"Most common filename tokens not in {NOISE_FILENAME}, "
-        "by number of files:\n")
-    width = len(str(ranked[0][1]))
-    for token, count in ranked:
-        print(f"  {count:>{width}}  {token}")
-    print(f"\nAdd any cruft above to {NOISE_FILENAME} (one per line) to skip it "
-        "when guessing names.", file=sys.stderr)
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    print(f"most common tokens not in {NOISE_FILENAME} (showing {len(ranked)}, "
+        "by file count) -- paste in and delete the names:", file=sys.stderr)
+    last = len(ranked) - 1
+    for index, (token, count) in enumerate(ranked):
+        comment = f"  # {count}" if index in (0, last) else ""
+        print(f"{token}{comment}")
     return 0
 
 
@@ -599,7 +617,7 @@ def main() -> int:
     files = source_files(source, options.show_all)
 
     if options.noise:
-        return run_noise(files, noise)
+        return run_noise(files, noise, options.noise_count)
 
     names = known_names(dest)
     index = build_index(names)
