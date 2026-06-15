@@ -9,7 +9,9 @@ automatically, borderline matches ask for confirmation. A dry run is performed
 unless --move is given.
 
 The --suggest mode instead reports unmatched files grouped by a best-guess name
-that does not yet exist in the destination.
+that does not yet exist in the destination. The --noise mode lists the most common
+filename tokens not already in group-people.noise.txt, the editable list of cruft
+skipped while guessing names.
 """
 
 from __future__ import annotations
@@ -52,11 +54,11 @@ TOKEN_RE = re.compile(r"[a-z0-9]+")
 # A bare four-digit year, treated as noise when guessing names.
 YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 
-# Common filename cruft skipped when guessing a name in --suggest mode.
-NOISE_TOKENS = frozenset({
-    "copy", "doc", "document", "draft", "file", "final", "img", "image",
-    "jpg", "pdf", "png", "scan", "scanned", "signed", "v", "version",
-})
+# Number of candidate tokens listed by the --noise diagnostic.
+TOP_TOKENS = 50
+
+# Editable list of filename cruft, kept beside this script and loaded at startup.
+NOISE_FILENAME = "group-people.noise.txt"
 
 
 class Tier(Enum):
@@ -128,6 +130,9 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         help="actually move files (default: dry run)")
     parser.add_argument("-s", "--suggest", action="store_true",
         help="report unmatched files grouped by a guessed new name, then exit")
+    parser.add_argument("--noise", action="store_true",
+        help=f"list the most common filename tokens not in {NOISE_FILENAME}, "
+        "then exit")
 
     borderline = parser.add_mutually_exclusive_group()
     borderline.add_argument("-y", "--yes", action="store_true",
@@ -173,6 +178,26 @@ def source_files(source: Path, show_all: bool) -> list[Path]:
             continue
         files.append(entry)
     return files
+
+
+def load_noise_tokens(path: Path) -> frozenset[str]:
+    """
+    Load the editable cruft list, warning with instructions if it is missing.
+
+    The file holds one token per line; blank lines and text after '#' are
+    ignored. A missing file leaves no tokens marked as noise.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        warn(f"no noise list at {path}; treating every token as significant\n"
+            "  run with --noise to list common tokens, then save them there "
+            "(one per line)")
+        return frozenset()
+    tokens: set[str] = set()
+    for line in text.splitlines():
+        tokens.update(tokenize(line.split("#", 1)[0]))
+    return frozenset(tokens)
 
 
 def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool]:
@@ -282,7 +307,8 @@ def build_vocabulary(names: list[str]) -> Vocabulary:
     return Vocabulary(frozenset(firsts), frozenset(lasts))
 
 
-def guess_name(stem: str, vocab: Vocabulary | None = None) -> str | None:
+def guess_name(stem: str, vocab: Vocabulary | None = None,
+        noise: frozenset[str] = frozenset()) -> str | None:
     """
     Best-guess a 'First Last' name from a filename, or None if none looks likely.
 
@@ -293,7 +319,7 @@ def guess_name(stem: str, vocab: Vocabulary | None = None) -> str | None:
     pair wins ties, so a leading noise word never displaces a real name.
     """
     tokens = [t for t in tokenize(stem) if len(t) >= 2
-        and not t.isdigit() and not YEAR_RE.match(t) and t not in NOISE_TOKENS]
+        and not t.isdigit() and not YEAR_RE.match(t) and t not in noise]
     pairs = [(a, b) for a, b in zip(tokens, tokens[1:]) if a.isalpha() and b.isalpha()]
     if not pairs:
         return None
@@ -386,7 +412,37 @@ def move_match(match: Match, dest: Path,
     return move_file(match.path, dest, name)
 
 
-def run_suggest(matches: list[Match], names: list[str]) -> int:
+def run_noise(files: list[Path], noise: frozenset[str]) -> int:
+    """
+    List the most common filename tokens not already in the noise list.
+
+    Tokens are counted once per file, so the ranking reflects how many files use
+    each word; cruft shared across many files rises to the top while names stay
+    rare. Years, bare numbers, and single characters are left out.
+    """
+    counts: dict[str, int] = {}
+    for path in files:
+        for token in {t for t in tokenize(path.stem) if len(t) >= 2
+                and not t.isdigit() and not YEAR_RE.match(t) and t not in noise}:
+            counts[token] = counts.get(token, 0) + 1
+
+    if not counts:
+        print(f"No candidate tokens found in {len(files)} file(s).")
+        return 0
+
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_TOKENS]
+    print(f"Most common filename tokens not in {NOISE_FILENAME}, "
+        "by number of files:\n")
+    width = len(str(ranked[0][1]))
+    for token, count in ranked:
+        print(f"  {count:>{width}}  {token}")
+    print(f"\nAdd any cruft above to {NOISE_FILENAME} (one per line) to skip it "
+        "when guessing names.", file=sys.stderr)
+    return 0
+
+
+def run_suggest(matches: list[Match], names: list[str],
+        noise: frozenset[str]) -> int:
     """
     Print unmatched files grouped by a guessed name not already in the destination.
     """
@@ -397,7 +453,7 @@ def run_suggest(matches: list[Match], names: list[str]) -> int:
     for match in matches:
         if match.tier is not Tier.NONE:
             continue
-        guess = guess_name(match.path.stem, vocab)
+        guess = guess_name(match.path.stem, vocab, noise)
         if guess is None or guess.lower() in existing:
             no_guess.append(match.path)
             continue
@@ -444,9 +500,14 @@ def main() -> int:
         return 2
 
     colorama.init()
+    noise = load_noise_tokens(Path(__file__).resolve().parent / NOISE_FILENAME)
+    files = source_files(source, options.show_all)
+
+    if options.noise:
+        return run_noise(files, noise)
+
     names = known_names(dest)
     index = build_index(names)
-    files = source_files(source, options.show_all)
     min_score: float = options.min_score
     auto_score: float = options.auto_score
     total = len(files)
@@ -457,7 +518,7 @@ def main() -> int:
             suggest_matches.append(build_match(path, index, min_score, auto_score))
             if number % 1000 == 0:
                 print(f"  scanned {number}/{total}...", file=sys.stderr)
-        return run_suggest(suggest_matches, names)
+        return run_suggest(suggest_matches, names, noise)
 
     if not names:
         warn(f"no name folders found in {dest}; try --suggest")
