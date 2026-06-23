@@ -24,25 +24,34 @@ if [ ! -d "$DEVICE_FOLDER" ]; then
 fi
 
 
+# Command
+cmd=(
+  rsync "$LOCAL_FOLDER" "$DEVICE_FOLDER"
+  -rtkvh --modify-window=2
+  --delete-delay --stats
+  --exclude=.kobo/
+  --exclude=.adobe-digital-editions/
+  --exclude=.kobo-images/
+)
+
 # Dry-run
-COMMAND='rsync "$LOCAL_FOLDER" "$DEVICE_FOLDER" -rtkvh --modify-window=2 '
-COMMAND+="--delete-delay --stats --exclude=.kobo/ "
-COMMAND+="--exclude=.adobe-digital-editions/ --exclude=.kobo-images/"
 echo "DRY RUN"
-echo "$COMMAND -n"
-eval "$COMMAND -n"
+printf '%q ' "${cmd[@]}" -n
+echo
+"${cmd[@]}" -n
 
 # Live?
 echo
 echo "###########################"
 echo "# Does this look correct? #"
 echo "###########################"
-read -p "Type 'yes' to execute: "
+read -rp "Type 'yes' to execute: "
 if [[ "$REPLY" =~ ^[yY].* ]];
 then
     echo
-    echo "$COMMAND"
-    eval "$COMMAND"
+    printf '%q ' "${cmd[@]}"
+    echo
+    "${cmd[@]}"
 else
     echo "Aborted"
 fi
