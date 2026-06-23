@@ -13,7 +13,7 @@ See:
 from pathlib import Path
 import re
 import sys
-from subprocess import check_output
+from subprocess import CalledProcessError, DEVNULL, check_output
 
 
 PREFIX_REGEX = re.compile(r"(PROJECT-\d+)", re.I)
@@ -26,8 +26,14 @@ def extract_prefix(branch: str) -> str|None:
     return prefix
 
 
-def get_branch_name() -> str:
-    branch = check_output(["git", "symbolic-ref", "--short", "HEAD"], text=True)
+def get_branch_name() -> str|None:
+    """Return the current branch, or None when HEAD is detached (e.g. mid-rebase)."""
+    try:
+        branch = check_output(
+            ["git", "symbolic-ref", "--short", "HEAD"], text=True, stderr=DEVNULL
+        )
+    except CalledProcessError:
+        return None
     return branch.strip()
 
 
@@ -43,6 +49,8 @@ def write_prefix(path: Path, prefix: str) -> None:
 def main() -> int:
     try:
         branch = get_branch_name()
+        if branch is None:  # Detached HEAD (rebase/merge): nothing to prefix
+            return 0
         prefix = extract_prefix(branch)
         if prefix is not None:          # Do nothing if branch regex fails
             path = Path(sys.argv[1])
