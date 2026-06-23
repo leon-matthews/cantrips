@@ -9,7 +9,7 @@ set -o nounset
 
 # Config
 LOCAL_FOLDER='/home/leon/Dropbox/Apps/Rakuten Kobo/'
-DEVICE_FOLDER='/media/leon/KOBOeReader/'
+DEVICE_FOLDER='/run/media/leon/KOBOeReader/'
 
 
 # Check

@@ -1,0 +1,21 @@
+# Filename cruft skipped when guessing a name in --suggest mode.
+#
+# One token per line; blank lines and text after '#' are ignored.
+# List likely additions with:  group-people.py --noise SOURCE DEST
+
+copy
+doc
+document
+draft
+file
+final
+img
+image
+jpg
+pdf
+png
+scan
+scanned
+signed
+v
+version

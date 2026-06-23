@@ -9,7 +9,9 @@ automatically, borderline matches ask for confirmation. A dry run is performed
 unless --move is given.
 
 The --suggest mode instead reports unmatched files grouped by a best-guess name
-that does not yet exist in the destination.
+that does not yet exist in the destination. The --noise mode lists the most common
+filename tokens not already in group-people.noise.txt, the editable list of cruft
+skipped while guessing names.
 """
 
 from __future__ import annotations
@@ -53,11 +55,11 @@ TOKEN_RE = re.compile(r"[a-z0-9]+")
 # A bare four-digit year, treated as noise when guessing names.
 YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 
-# Common filename cruft skipped when guessing a name in --suggest mode.
-NOISE_TOKENS = frozenset({
-    "copy", "doc", "document", "draft", "file", "final", "img", "image",
-    "jpg", "pdf", "png", "scan", "scanned", "signed", "v", "version",
-})
+# Number of candidate tokens listed by the --noise diagnostic.
+TOP_TOKENS = 50
+
+# Editable list of filename cruft, kept beside this script and loaded at startup.
+NOISE_FILENAME = "group-people.noise.txt"
 
 
 class Tier(Enum):
@@ -101,6 +103,15 @@ class Vocabulary:
 
 
 @dataclass(frozen=True)
+class Corpus:
+    """
+    File counts of tokens and adjacent token pairs across the source filenames.
+    """
+    token_df: dict[str, int]                # Token -> number of files holding it.
+    pair_df: dict[tuple[str, str], int]     # Adjacent pair -> number of files.
+
+
+@dataclass(frozen=True)
 class NameIndex:
     """
     Destination names with lookup tables that narrow matching to a few candidates.
@@ -130,6 +141,9 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         help="actually move files (default: dry run)")
     parser.add_argument("-s", "--suggest", action="store_true",
         help="report unmatched files grouped by a guessed new name, then exit")
+    parser.add_argument("--noise", action="store_true",
+        help=f"list the most common filename tokens not in {NOISE_FILENAME} "
+        f"(use --noise=N for the top N, default {TOP_TOKENS}), then exit")
 
     borderline = parser.add_mutually_exclusive_group()
     borderline.add_argument("-y", "--yes", action="store_true",
@@ -148,7 +162,24 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
         metavar="N", help=f"score (0-100) at/above which an adjacent match moves "
         f"automatically (default: {DEFAULT_AUTO_SCORE:g})")
 
-    return parser.parse_args(args)
+    # --noise carries an optional attached count (--noise=N); pull it out before
+    # parsing so a following source path is never mistaken for the count.
+    noise_count = TOP_TOKENS
+    scrubbed: list[str] = []
+    for arg in args:
+        if arg.startswith("--noise="):
+            value = arg.removeprefix("--noise=")
+            if not value.isdigit():
+                parser.error(f"--noise count must be a non-negative integer, "
+                    f"not {value!r}")
+            noise_count = int(value)
+            scrubbed.append("--noise")
+        else:
+            scrubbed.append(arg)
+
+    namespace = parser.parse_args(scrubbed)
+    namespace.noise_count = noise_count
+    return namespace
 
 
 def tokenize(text: str) -> list[str]:
@@ -156,6 +187,21 @@ def tokenize(text: str) -> list[str]:
     Return the lowercase alphanumeric tokens of a string.
     """
     return TOKEN_RE.findall(text.lower())
+
+
+def name_tokens(stem: str, noise: frozenset[str]) -> list[str]:
+    """
+    Tokenise a filename stem, dropping years, bare numbers, and noise words.
+    """
+    return [t for t in tokenize(stem) if len(t) >= 2
+        and not t.isdigit() and not YEAR_RE.match(t) and t not in noise]
+
+
+def name_pairs(tokens: list[str]) -> list[tuple[str, str]]:
+    """
+    Return the adjacent token pairs whose tokens are both alphabetic.
+    """
+    return [(a, b) for a, b in zip(tokens, tokens[1:]) if a.isalpha() and b.isalpha()]
 
 
 def known_names(dest: Path) -> list[str]:
@@ -177,6 +223,26 @@ def source_files(source: Path, show_all: bool) -> list[Path]:
             continue
         files.append(entry)
     return files
+
+
+def load_noise_tokens(path: Path) -> frozenset[str]:
+    """
+    Load the editable cruft list, warning with instructions if it is missing.
+
+    The file holds one token per line; blank lines and text after '#' are
+    ignored. A missing file leaves no tokens marked as noise.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        warn(f"no noise list at {path}; treating every token as significant\n"
+            "  run with --noise to list common tokens, then save them there "
+            "(one per line)")
+        return frozenset()
+    tokens: set[str] = set()
+    for line in text.splitlines():
+        tokens.update(tokenize(line.split("#", 1)[0]))
+    return frozenset(tokens)
 
 
 def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool, int]:
@@ -294,23 +360,62 @@ def build_vocabulary(names: list[str]) -> Vocabulary:
     return Vocabulary(frozenset(firsts), frozenset(lasts))
 
 
-def guess_name(stem: str, vocab: Vocabulary | None = None) -> str | None:
+def build_corpus(files: list[Path], noise: frozenset[str]) -> Corpus:
+    """
+    Count how many files each token and each adjacent pair appears in.
+
+    Counting once per file makes a recurring name pair stand out: a person's name
+    appears across all of their files while the surrounding cruft varies.
+    """
+    token_df: dict[str, int] = {}
+    pair_df: dict[tuple[str, str], int] = {}
+    for path in files:
+        tokens = name_tokens(path.stem, noise)
+        for token in set(tokens):
+            token_df[token] = token_df.get(token, 0) + 1
+        for pair in set(name_pairs(tokens)):
+            pair_df[pair] = pair_df.get(pair, 0) + 1
+    return Corpus(token_df, pair_df)
+
+
+def exclusive_pair(pairs: list[tuple[str, str]], corpus: Corpus) -> tuple[str, str]:
+    """
+    Pick the pair whose tokens most exclusively co-occur across the source files.
+
+    A pair scores its file count over the commoner token's file count, so a
+    recurring name unit beats a cruft word whose partner also turns up elsewhere.
+    The earliest pair wins ties.
+    """
+    best = -1.0
+    chosen = pairs[0]
+    for left, right in pairs:
+        denom = max(corpus.token_df.get(left, 1), corpus.token_df.get(right, 1))
+        score = corpus.pair_df.get((left, right), 0) / denom
+        if score > best:                # Strict, so the earliest pair wins ties.
+            best = score
+            chosen = left, right
+    return chosen
+
+
+def guess_name(stem: str, vocab: Vocabulary | None = None,
+        noise: frozenset[str] = frozenset(),
+        corpus: Corpus | None = None) -> str | None:
     """
     Best-guess a 'First Last' name from a filename, or None if none looks likely.
 
     Years, bare numbers, single characters, and common cruft are dropped to leave
     candidate adjacent token pairs. Given a vocabulary, the pair whose tokens best
     fit known first/last name positions wins, and an apparently reversed
-    'Last First' pair is flipped; otherwise the first pair is taken. The earliest
-    pair wins ties, so a leading noise word never displaces a real name.
+    'Last First' pair is flipped. When no name part is known, a corpus picks the
+    pair whose tokens most exclusively co-occur across the source files rather than
+    the leading pair. The earliest pair wins ties.
     """
-    tokens = [t for t in tokenize(stem) if len(t) >= 2
-        and not t.isdigit() and not YEAR_RE.match(t) and t not in NOISE_TOKENS]
-    pairs = [(a, b) for a, b in zip(tokens, tokens[1:]) if a.isalpha() and b.isalpha()]
+    tokens = name_tokens(stem, noise)
+    pairs = name_pairs(tokens)
     if not pairs:
         return None
 
-    best_score = -1
+    vocab_score = -1
     first, last = pairs[0]
     if vocab is not None:
         for left, right in pairs:
@@ -321,9 +426,13 @@ def guess_name(stem: str, vocab: Vocabulary | None = None) -> str | None:
                 score, ordered = reverse, (right, left)
             else:
                 score, ordered = forward, (left, right)
-            if score > best_score:      # Strict, so the earliest pair wins ties.
-                best_score = score
+            if score > vocab_score:     # Strict, so the earliest pair wins ties.
+                vocab_score = score
                 first, last = ordered
+
+    # With no known name part, recurrence across files beats filename position.
+    if vocab_score < 1 and corpus is not None:
+        first, last = exclusive_pair(pairs, corpus)
     return f"{first.title()} {last.title()}"
 
 
@@ -415,18 +524,49 @@ def move_match(match: Match, dest: Path,
     return move_file(match.path, dest, name, overwrite)
 
 
-def run_suggest(matches: list[Match], names: list[str]) -> int:
+def run_noise(files: list[Path], noise: frozenset[str], limit: int) -> int:
+    """
+    List the most common filename tokens not already in the noise list.
+
+    Tokens are counted once per file, so the ranking reflects how many files use
+    each word; cruft shared across many files rises to the top while names stay
+    rare. Years, bare numbers, and single characters are left out. The bare tokens
+    print to stdout ready to paste into the noise file, with the file count shown
+    as a strippable comment on the first and last entries only.
+    """
+    counts: dict[str, int] = {}
+    for path in files:
+        for token in set(name_tokens(path.stem, noise)):
+            counts[token] = counts.get(token, 0) + 1
+
+    if not counts:
+        print(f"no candidate tokens found in {len(files)} file(s)", file=sys.stderr)
+        return 0
+
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    print(f"most common tokens not in {NOISE_FILENAME} (showing {len(ranked)}, "
+        "by file count) -- paste in and delete the names:", file=sys.stderr)
+    last = len(ranked) - 1
+    for index, (token, count) in enumerate(ranked):
+        comment = f"  # {count}" if index in (0, last) else ""
+        print(f"{token}{comment}")
+    return 0
+
+
+def run_suggest(matches: list[Match], names: list[str],
+        noise: frozenset[str]) -> int:
     """
     Print unmatched files grouped by a guessed name not already in the destination.
     """
     existing = {name.lower() for name in names}
     vocab = build_vocabulary(names)
+    corpus = build_corpus([match.path for match in matches], noise)
     groups: dict[str, list[Path]] = {}
     no_guess: list[Path] = []
     for match in matches:
         if match.tier is not Tier.NONE:
             continue
-        guess = guess_name(match.path.stem, vocab)
+        guess = guess_name(match.path.stem, vocab, noise, corpus)
         if guess is None or guess.lower() in existing:
             no_guess.append(match.path)
             continue
@@ -473,9 +613,14 @@ def main() -> int:
         return 2
 
     colorama.init()
+    noise = load_noise_tokens(Path(__file__).resolve().parent / NOISE_FILENAME)
+    files = source_files(source, options.show_all)
+
+    if options.noise:
+        return run_noise(files, noise, options.noise_count)
+
     names = known_names(dest)
     index = build_index(names)
-    files = source_files(source, options.show_all)
     min_score: float = options.min_score
     auto_score: float = options.auto_score
     total = len(files)
@@ -486,7 +631,7 @@ def main() -> int:
             suggest_matches.append(build_match(path, index, min_score, auto_score))
             if number % 1000 == 0:
                 print(f"  scanned {number}/{total}...", file=sys.stderr)
-        return run_suggest(suggest_matches, names)
+        return run_suggest(suggest_matches, names, noise)
 
     if not names:
         warn(f"no name folders found in {dest}; try --suggest")
