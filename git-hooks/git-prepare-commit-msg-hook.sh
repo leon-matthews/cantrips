@@ -15,7 +15,7 @@ commit_msg_file="$1"
 
 # Extract prefix from branch name
 shopt -s nocasematch
-branch=$(git symbolic-ref --short HEAD) || exit 0
+branch=$(git symbolic-ref --short HEAD 2>/dev/null) || exit 0
 if [[ "$branch" =~ (PROJECT-[0-9]+) ]]; then
     prefix="${BASH_REMATCH[1]}"
 else
