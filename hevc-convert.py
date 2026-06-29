@@ -30,9 +30,14 @@ import sys
 from tempfile import TemporaryDirectory
 import threading
 
+from rich.console import Console, Group
+from rich.live import Live
 from rich.progress import (
     BarColumn,
+    MofNCompleteColumn,
     Progress,
+    ProgressColumn,
+    TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
@@ -171,6 +176,10 @@ BAR_WIDTH = 40
 # percent (4) + separator (1) + elapsed (7) + separator (1) + remaining (7) + gaps (6).
 OTHER_COLUMNS_WIDTH = BAR_WIDTH + 26
 
+# x265 'slower' emits output packets in bursts, so out_time can sit flat for many
+# seconds; widen rich's default 30s speed window so the ETA stops blanking out.
+SPEED_ESTIMATE_PERIOD = 120.0
+
 
 def _format_description(name: str, width: int) -> str:
     """Truncate with an ellipsis or right-pad ``name`` so it occupies ``width`` chars."""
@@ -179,18 +188,14 @@ def _format_description(name: str, width: int) -> str:
     return name.ljust(width)
 
 
-def run_ffmpeg_with_progress(args: list[str], description: str, total: float | None) -> None:
-    """
-    Run ffmpeg, parsing its ``-progress`` stream to drive a rich progress bar.
+def _description_width() -> int:
+    """Columns available for the description, given the fixed-width columns."""
+    return max(10, shutil.get_terminal_size().columns - OTHER_COLUMNS_WIDTH)
 
-    Raises:
-        subprocess.CalledProcessError:
-            On non-zero exit, with stderr attached.
-    """
-    desc_width = max(10, shutil.get_terminal_size().columns - OTHER_COLUMNS_WIDTH)
-    description = _format_description(description, desc_width)
 
-    columns = [
+def _file_columns() -> list[ProgressColumn]:
+    """Columns for the per-file encode bar."""
+    return [
         TextColumn("[progress.description]{task.description}"),
         BarColumn(bar_width=BAR_WIDTH),
         TaskProgressColumn(),
@@ -200,6 +205,26 @@ def run_ffmpeg_with_progress(args: list[str], description: str, total: float | N
         TimeRemainingColumn(),
     ]
 
+
+def _overall_columns() -> list[ProgressColumn]:
+    """Columns for the top-level batch bar."""
+    return [
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=BAR_WIDTH),
+        MofNCompleteColumn(),
+        TextColumn("files"),
+        TimeElapsedColumn(),
+    ]
+
+
+def run_ffmpeg(args: list[str], progress: Progress, task_id: TaskID) -> None:
+    """
+    Run ffmpeg, parsing its ``-progress`` stream to advance ``task_id``.
+
+    Raises:
+        subprocess.CalledProcessError:
+            On non-zero exit, with stderr attached.
+    """
     proc = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
@@ -214,15 +239,11 @@ def run_ffmpeg_with_progress(args: list[str], description: str, total: float | N
     stderr_thread = threading.Thread(target=lambda: stderr_buf.extend(stderr))
     stderr_thread.start()
 
-    with Progress(*columns) as progress:
-        task = progress.add_task(description, total=total)
-        for line in stdout:
-            if line.startswith('out_time_us='):
-                value = line.split('=', 1)[1].strip()
-                if value.isdigit():
-                    progress.update(task, completed=int(value) / 1_000_000)
-        if total is not None:
-            progress.update(task, completed=total)
+    for line in stdout:
+        if line.startswith('out_time_us='):
+            value = line.split('=', 1)[1].strip()
+            if value.isdigit():
+                progress.update(task_id, completed=int(value) / 1_000_000)
 
     proc.wait()
     stderr_thread.join()
@@ -232,7 +253,12 @@ def run_ffmpeg_with_progress(args: list[str], description: str, total: float | N
         )
 
 
-def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace) -> None:
+def hevc_convert(
+    original: Path,
+    temp_folder: Path,
+    options: argparse.Namespace,
+    progress: Progress | None = None,
+) -> None:
     """
     Convert video in-place.
 
@@ -243,6 +269,8 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
             Folder to save partially encoded file into.
         options:
             Command-line options
+        progress:
+            Live display to attach a per-file task to. Unused for dry runs.
     """
     suffix = '.mkv' if options.mkv else '.mp4'
     output_name = original.with_suffix(suffix).name
@@ -252,13 +280,21 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
     if options.dry_run:
         print(' '.join(args))
         return
+    assert progress is not None
 
     duration = ffprobe_duration(original)
+    description = _format_description(original.name, _description_width())
+    task = progress.add_task(description, total=duration)
     try:
-        run_ffmpeg_with_progress(args, original.name, duration)
+        run_ffmpeg(args, progress, task)
     except subprocess.CalledProcessError as e:
         sys.stderr.write(e.stderr or '')
         raise
+    # Fill the bar, archive it to the scrollback, then drop it from the live region.
+    progress.update(task, total=duration or 1, completed=duration or 1)
+    finished = next(t for t in progress.tasks if t.id == task)
+    progress.console.print(progress.make_tasks_table([finished]))
+    progress.remove_task(task)
 
     dest = original.parent / output_name
     part = dest.with_name(dest.name + '.part')
@@ -268,15 +304,41 @@ def hevc_convert(original: Path, temp_folder: Path, options: argparse.Namespace)
 
 
 def main(options: argparse.Namespace) -> int:
-    videos = [Path(name) for name in options.videos]
+    files: list[Path] = []
+    for name in options.videos:
+        video = Path(name)
+        if video.is_dir():
+            print(f"Skipping folder: {video}", file=sys.stderr)
+        else:
+            files.append(video)
 
-    with TemporaryDirectory(prefix='hevc-convert-') as temp_folder:
-        for video in videos:
-            if video.is_dir():
-                print(f"Skipping folder: {video}", file=sys.stderr)
-                continue
+    with TemporaryDirectory(prefix='hevc-convert-') as temp_dir:
+        temp_folder = Path(temp_dir)
 
-            hevc_convert(video, Path(temp_folder), options)
+        if options.dry_run:
+            for video in files:
+                hevc_convert(video, temp_folder, options)
+            return 0
+
+        console = Console()
+        file_progress = Progress(
+            *_file_columns(), console=console, speed_estimate_period=SPEED_ESTIMATE_PERIOD,
+        )
+        overall_progress = Progress(*_overall_columns(), console=console)
+
+        # Show the batch bar only when there is more than one file to convert.
+        overall_task: TaskID | None = None
+        renderables: list[Progress] = [file_progress]
+        if len(files) > 1:
+            description = _format_description('Converting', _description_width())
+            overall_task = overall_progress.add_task(description, total=len(files))
+            renderables = [overall_progress, file_progress]
+
+        with Live(Group(*renderables), console=console, refresh_per_second=10):
+            for video in files:
+                hevc_convert(video, temp_folder, options, file_progress)
+                if overall_task is not None:
+                    overall_progress.advance(overall_task)
 
     return 0
 
