@@ -46,6 +46,12 @@ DEFAULT_MIN_SCORE = 80.0
 # A clear winner must beat the runner-up name by this margin to move on its own.
 AMBIGUITY_MARGIN = 4.0
 
+# A corpus-guessed name pair must appear in at least this many source files.
+MIN_PAIR_FILES = 2
+
+# Fraction of all source files above which a recurring pair is cruft, not a name.
+MAX_NAME_SHARE = 1 / 3
+
 # Token prefix length used to block names for fuzzy candidate generation.
 PREFIX_LEN = 3
 
@@ -109,6 +115,7 @@ class Corpus:
     """
     token_df: dict[str, int]                # Token -> number of files holding it.
     pair_df: dict[tuple[str, str], int]     # Adjacent pair -> number of files.
+    total: int                              # Number of files counted.
 
 
 @dataclass(frozen=True)
@@ -375,25 +382,31 @@ def build_corpus(files: list[Path], noise: frozenset[str]) -> Corpus:
             token_df[token] = token_df.get(token, 0) + 1
         for pair in set(name_pairs(tokens)):
             pair_df[pair] = pair_df.get(pair, 0) + 1
-    return Corpus(token_df, pair_df)
+    return Corpus(token_df, pair_df, len(files))
 
 
-def exclusive_pair(pairs: list[tuple[str, str]], corpus: Corpus) -> tuple[str, str]:
+def likely_name_pair(pairs: list[tuple[str, str]],
+        corpus: Corpus) -> tuple[str, str] | None:
     """
-    Pick the pair whose tokens most exclusively co-occur across the source files.
+    Pick the pair that most plausibly names a person, or None when none does.
 
-    A pair scores its file count over the commoner token's file count, so a
-    recurring name unit beats a cruft word whose partner also turns up elsewhere.
-    The earliest pair wins ties.
+    A pair must recur across files to count as name evidence, yet one present in
+    too large a share of all files is cruft: one person rarely owns most of the
+    pile. Among the rest, a pair scores its file count over the commoner token's
+    file count, so a recurring name unit beats a cruft word whose partner also
+    turns up elsewhere. The latest pair wins ties, as cruft precedes names.
     """
     best = -1.0
-    chosen = pairs[0]
-    for left, right in pairs:
-        denom = max(corpus.token_df.get(left, 1), corpus.token_df.get(right, 1))
-        score = corpus.pair_df.get((left, right), 0) / denom
-        if score > best:                # Strict, so the earliest pair wins ties.
+    chosen: tuple[str, str] | None = None
+    for pair in pairs:
+        count = corpus.pair_df.get(pair, 0)
+        if count < MIN_PAIR_FILES or count > corpus.total * MAX_NAME_SHARE:
+            continue
+        denom = max(corpus.token_df.get(pair[0], 1), corpus.token_df.get(pair[1], 1))
+        score = count / denom
+        if score >= best:               # Not strict, so the latest pair wins ties.
             best = score
-            chosen = left, right
+            chosen = pair
     return chosen
 
 
@@ -407,8 +420,9 @@ def guess_name(stem: str, vocab: Vocabulary | None = None,
     candidate adjacent token pairs. Given a vocabulary, the pair whose tokens best
     fit known first/last name positions wins, and an apparently reversed
     'Last First' pair is flipped. When no name part is known, a corpus picks the
-    pair whose tokens most exclusively co-occur across the source files rather than
-    the leading pair. The earliest pair wins ties.
+    pair whose tokens most exclusively co-occur across the source files, or None
+    when no recurring, name-like pair exists. The latest pair wins ties, as noise
+    tends to precede the name in real filenames.
     """
     tokens = name_tokens(stem, noise)
     pairs = name_pairs(tokens)
@@ -426,13 +440,16 @@ def guess_name(stem: str, vocab: Vocabulary | None = None,
                 score, ordered = reverse, (right, left)
             else:
                 score, ordered = forward, (left, right)
-            if score > vocab_score:     # Strict, so the earliest pair wins ties.
+            if score >= vocab_score:    # Not strict, so the latest pair wins ties.
                 vocab_score = score
                 first, last = ordered
 
     # With no known name part, recurrence across files beats filename position.
     if vocab_score < 1 and corpus is not None:
-        first, last = exclusive_pair(pairs, corpus)
+        pair = likely_name_pair(pairs, corpus)
+        if pair is None:
+            return None
+        first, last = pair
     return f"{first.title()} {last.title()}"
 
 
