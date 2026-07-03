@@ -1,0 +1,5 @@
+# Non-name suggestions skipped by --suggest and --review.
+#
+# One ignored name per line, e.g. 'Bank Statement'; blank lines and text
+# after '#' are ignored, as are case and word order. Rejecting a name in
+# --review mode records it here automatically.

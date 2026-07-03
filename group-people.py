@@ -9,9 +9,12 @@ automatically, borderline matches ask for confirmation. A dry run is performed
 unless --move is given.
 
 The --suggest mode instead reports unmatched files grouped by a best-guess name
-that does not yet exist in the destination. The --noise mode lists the most common
-filename tokens not already in group-people.noise.txt, the editable list of cruft
-skipped while guessing names.
+that does not yet exist in the destination; names listed in group-people.ignore.txt
+are never suggested. The --review mode walks those suggestions interactively,
+biggest group first: accepting a name creates its folder and moves its files at
+once, while rejecting one records it in the ignore file. The --noise mode lists
+the most common filename tokens not already in group-people.noise.txt, the
+editable list of cruft skipped while guessing names.
 """
 
 from __future__ import annotations
@@ -66,6 +69,21 @@ TOP_TOKENS = 50
 
 # Editable list of filename cruft, kept beside this script and loaded at startup.
 NOISE_FILENAME = "group-people.noise.txt"
+
+# Editable list of non-name suggestions, kept beside this script.
+IGNORE_FILENAME = "group-people.ignore.txt"
+
+# Written atop a new ignore file created by a --review rejection.
+IGNORE_HEADER = """\
+# Non-name suggestions skipped by --suggest and --review.
+#
+# One ignored name per line, e.g. 'Bank Statement'; blank lines and text
+# after '#' are ignored, as are case and word order. Rejecting a name in
+# --review mode records it here automatically.
+"""
+
+# Number of example files shown for each suggestion in --review mode.
+REVIEW_SAMPLE = 8
 
 
 class Tier(Enum):
@@ -146,9 +164,13 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
 
     parser.add_argument("-m", "--move", action="store_true",
         help="actually move files (default: dry run)")
-    parser.add_argument("-s", "--suggest", action="store_true",
+
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("-s", "--suggest", action="store_true",
         help="report unmatched files grouped by a guessed new name, then exit")
-    parser.add_argument("--noise", action="store_true",
+    modes.add_argument("-r", "--review", action="store_true",
+        help="interactively accept or reject suggested new names, then exit")
+    modes.add_argument("--noise", action="store_true",
         help=f"list the most common filename tokens not in {NOISE_FILENAME} "
         f"(use --noise=N for the top N, default {TOP_TOKENS}), then exit")
 
@@ -250,6 +272,27 @@ def load_noise_tokens(path: Path) -> frozenset[str]:
     for line in text.splitlines():
         tokens.update(tokenize(line.split("#", 1)[0]))
     return frozenset(tokens)
+
+
+def load_ignore_pairs(path: Path) -> frozenset[tuple[str, str]]:
+    """
+    Load the editable list of non-name suggestions as token pairs, both orders.
+
+    The file holds one ignored name per line, e.g. 'Bank Statement'; blank lines
+    and text after '#' are ignored, as are case and word order. A missing file
+    leaves nothing ignored.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    pairs: set[tuple[str, str]] = set()
+    for line in text.splitlines():
+        tokens = tokenize(line.split("#", 1)[0])
+        for left, right in zip(tokens, tokens[1:]):
+            pairs.add((left, right))
+            pairs.add((right, left))
+    return frozenset(pairs)
 
 
 def score_name(file_tokens: list[str], wanted: list[str]) -> tuple[float, bool, int]:
@@ -412,20 +455,22 @@ def likely_name_pair(pairs: list[tuple[str, str]],
 
 def guess_name(stem: str, vocab: Vocabulary | None = None,
         noise: frozenset[str] = frozenset(),
-        corpus: Corpus | None = None) -> str | None:
+        corpus: Corpus | None = None,
+        ignored: frozenset[tuple[str, str]] = frozenset()) -> str | None:
     """
     Best-guess a 'First Last' name from a filename, or None if none looks likely.
 
     Years, bare numbers, single characters, and common cruft are dropped to leave
-    candidate adjacent token pairs. Given a vocabulary, the pair whose tokens best
-    fit known first/last name positions wins, and an apparently reversed
-    'Last First' pair is flipped. When no name part is known, a corpus picks the
-    pair whose tokens most exclusively co-occur across the source files, or None
-    when no recurring, name-like pair exists. The latest pair wins ties, as noise
-    tends to precede the name in real filenames.
+    candidate adjacent token pairs; pairs in the ignored set are discarded too,
+    letting a lesser pair from the same filename win instead. Given a vocabulary,
+    the pair whose tokens best fit known first/last name positions wins, and an
+    apparently reversed 'Last First' pair is flipped. When no name part is known,
+    a corpus picks the pair whose tokens most exclusively co-occur across the
+    source files, or None when no recurring, name-like pair exists. The latest
+    pair wins ties, as noise tends to precede the name in real filenames.
     """
     tokens = name_tokens(stem, noise)
-    pairs = name_pairs(tokens)
+    pairs = [pair for pair in name_pairs(tokens) if pair not in ignored]
     if not pairs:
         return None
 
@@ -570,10 +615,12 @@ def run_noise(files: list[Path], noise: frozenset[str], limit: int) -> int:
     return 0
 
 
-def run_suggest(matches: list[Match], names: list[str],
-        noise: frozenset[str]) -> int:
+def suggest_groups(matches: list[Match], names: list[str], noise: frozenset[str],
+        ignored: frozenset[tuple[str, str]]) -> tuple[dict[str, list[Path]], list[Path]]:
     """
-    Print unmatched files grouped by a guessed name not already in the destination.
+    Group the unmatched files by guessed names that are new to the destination.
+
+    Returns the groups plus the leftover files whose name could not be guessed.
     """
     existing = {name.lower() for name in names}
     vocab = build_vocabulary(names)
@@ -583,20 +630,35 @@ def run_suggest(matches: list[Match], names: list[str],
     for match in matches:
         if match.tier is not Tier.NONE:
             continue
-        guess = guess_name(match.path.stem, vocab, noise, corpus)
+        guess = guess_name(match.path.stem, vocab, noise, corpus, ignored)
         if guess is None or guess.lower() in existing:
             no_guess.append(match.path)
             continue
         groups.setdefault(guess, []).append(match.path)
+    return groups, no_guess
 
+
+def print_group(name: str, paths: list[Path], limit: int | None = None) -> None:
+    """
+    Print one suggested name and its files, sampling them when limit is given.
+    """
+    print(colorama.Fore.CYAN + f"{name} ({len(paths)})" + colorama.Style.RESET_ALL)
+    shown = paths if limit is None else paths[:limit]
+    for path in shown:
+        print(f"    {path.name}")
+    if len(paths) > len(shown):
+        print(f"    ... and {len(paths) - len(shown)} more")
+
+
+def run_suggest(groups: dict[str, list[Path]], no_guess: list[Path]) -> int:
+    """
+    Print unmatched files grouped by a guessed name not already in the destination.
+    """
     if groups:
         print("Suggested new folders (not yet in the destination):\n")
         # Fewest matches first so the names with the most files end up last.
         for name in sorted(groups, key=lambda n: (len(groups[n]), n)):
-            print(colorama.Fore.CYAN + f"{name} ({len(groups[name])})"
-                + colorama.Style.RESET_ALL)
-            for path in groups[name]:
-                print(f"    {path.name}")
+            print_group(name, groups[name])
         print()
 
     if no_guess:
@@ -604,6 +666,114 @@ def run_suggest(matches: list[Match], names: list[str],
 
     print(f"\n{len(groups)} suggested new name(s).", file=sys.stderr)
     return 0
+
+
+def ask_review(name: str) -> str:
+    """
+    Ask what to do with one suggested name, returning one of 'y n e s q'.
+
+    An empty answer skips and EOF quits: a rejection is written to the ignore
+    file, so it must always be deliberate.
+    """
+    prompt = f"Accept {name!r}? [y]es, [n]ot a name, [e]dit, [S]kip, [q]uit: "
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            print()
+            return "q"
+        if not answer:
+            return "s"
+        if answer[0] in "ynesq":
+            return answer[0]
+
+
+def ask_new_name() -> str | None:
+    """
+    Ask for a corrected folder name, or None to cancel.
+
+    An empty answer, EOF, or a path separator in the name cancels the edit.
+    """
+    try:
+        answer = input("Folder name: ").strip()
+    except EOFError:
+        print()
+        return None
+    if not answer or "/" in answer:
+        return None
+    return answer
+
+
+def append_ignore(path: Path, name: str) -> None:
+    """
+    Record a rejected suggestion in the ignore file, creating it if needed.
+    """
+    if not path.exists():
+        path.write_text(IGNORE_HEADER, encoding="utf-8")
+    with path.open("a", encoding="utf-8") as file:
+        file.write(f"{name}\n")
+
+
+def run_review(groups: dict[str, list[Path]], no_guess: list[Path], dest: Path,
+        ignore_path: Path, overwrite: bool) -> int:
+    """
+    Interactively accept, reject, or skip each suggested name, biggest group first.
+
+    Accepting a name (possibly edited first) creates its destination folder and
+    moves its files at once; rejecting appends the name to the ignore file.
+    Every decision takes effect as it is made, so quitting or interrupting the
+    review keeps the decisions already taken.
+    """
+    if not groups:
+        print("no new names to suggest; "
+            f"{len(no_guess)} unmatched file(s) with no confident guess",
+            file=sys.stderr)
+        return 0
+
+    accepted = moved = rejected = skipped = reviewed = 0
+    interrupted = False
+    ordered = sorted(groups, key=lambda n: (-len(groups[n]), n))
+    try:
+        for name in ordered:
+            paths = groups[name]
+            print()
+            print_group(name, paths, REVIEW_SAMPLE)
+            answer = ask_review(name)
+            if answer == "e":
+                edited = ask_new_name()
+                if edited is None:
+                    answer = "s"
+                else:
+                    name, answer = edited, "y"
+            if answer == "q":
+                break
+            reviewed += 1
+            if answer == "y":
+                accepted += 1
+                for path in paths:
+                    if move_file(path, dest, name, overwrite):
+                        moved += 1
+            elif answer == "n":
+                append_ignore(ignore_path, name)
+                rejected += 1
+            else:
+                skipped += 1
+    except KeyboardInterrupt:
+        interrupted = True
+        print()
+        warn("interrupted; the decisions already made are kept")
+
+    unreviewed = len(ordered) - reviewed
+    summary = (f"accepted {accepted} name(s) ({moved} files moved), "
+        f"rejected {rejected}, skipped {skipped + unreviewed}, "
+        f"{len(no_guess)} file(s) with no guess")
+    print(colorama.Fore.YELLOW + summary + colorama.Style.RESET_ALL,
+        file=sys.stderr)
+    if accepted:
+        print("New folders improve both matching and guessing: run --review "
+            "again to catch files that had no confident guess this round.",
+            file=sys.stderr)
+    return 130 if interrupted else 0
 
 
 def warn(message: str) -> None:
@@ -630,7 +800,8 @@ def main() -> int:
         return 2
 
     colorama.init()
-    noise = load_noise_tokens(Path(__file__).resolve().parent / NOISE_FILENAME)
+    here = Path(__file__).resolve().parent
+    noise = load_noise_tokens(here / NOISE_FILENAME)
     files = source_files(source, options.show_all)
 
     if options.noise:
@@ -642,13 +813,19 @@ def main() -> int:
     auto_score: float = options.auto_score
     total = len(files)
 
-    if options.suggest:
+    if options.suggest or options.review:
+        ignore_path = here / IGNORE_FILENAME
+        ignored = load_ignore_pairs(ignore_path)
         suggest_matches: list[Match] = []
         for number, path in enumerate(files, start=1):
             suggest_matches.append(build_match(path, index, min_score, auto_score))
             if number % 1000 == 0:
                 print(f"  scanned {number}/{total}...", file=sys.stderr)
-        return run_suggest(suggest_matches, names, noise)
+        groups, no_guess = suggest_groups(suggest_matches, names, noise, ignored)
+        if options.review:
+            return run_review(groups, no_guess, dest, ignore_path,
+                options.overwrite)
+        return run_suggest(groups, no_guess)
 
     if not names:
         warn(f"no name folders found in {dest}; try --suggest")
