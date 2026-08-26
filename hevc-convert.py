@@ -23,18 +23,20 @@ Recompress video files in place to HEVC using FFMPEG and libx265.
 """
 
 import argparse
+from datetime import timedelta
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
+import time
 
-from rich.console import Console, Group
+from rich.cells import cell_len
+from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
 from rich.live import Live
 from rich.progress import (
     BarColumn,
-    MofNCompleteColumn,
     Progress,
     ProgressColumn,
     TaskID,
@@ -43,6 +45,8 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.table import Column
+from rich.text import Text
 
 
 class FFmpegArgumentBuilder:
@@ -172,31 +176,42 @@ def ffprobe_duration(path: Path) -> float | None:
 
 
 BAR_WIDTH = 40
-# Approximate width consumed by every column except the description:
-# percent (4) + separator (1) + elapsed (7) + separator (1) + remaining (7) + gaps (6).
-OTHER_COLUMNS_WIDTH = BAR_WIDTH + 26
+# Every row stops one column short of the right margin: a line flush against it is
+# rewrapped by the terminal if the window ever comes back narrower, eg. after sleep.
+RIGHT_MARGIN = 1
 
 # x265 'slower' emits output packets in bursts, so out_time can sit flat for many
 # seconds; widen rich's default 30s speed window so the ETA stops blanking out.
 SPEED_ESTIMATE_PERIOD = 120.0
 
 
-def _format_description(name: str, width: int) -> str:
-    """Truncate with an ellipsis or right-pad ``name`` so it occupies ``width`` chars."""
-    if len(name) > width:
-        return name[: width - 1] + '…'
-    return name.ljust(width)
+def _format_description(name: str, width: int) -> Text:
+    """Truncate with an ellipsis or right-pad ``name`` so it occupies ``width`` cells."""
+    description = Text(name, no_wrap=True, overflow='ellipsis')
+    description.truncate(width, pad=True)
+    return description
 
 
-def _description_width() -> int:
-    """Columns available for the description, given the fixed-width columns."""
-    return max(10, shutil.get_terminal_size().columns - OTHER_COLUMNS_WIDTH)
+class _RightMargin:
+    """Render ``renderable`` one column short of the console's right margin."""
+
+    def __init__(self, renderable: RenderableType) -> None:
+        self.renderable = renderable
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        width = max(10, options.max_width - RIGHT_MARGIN)
+        yield from console.render(self.renderable, options.update_width(width))
 
 
 def _file_columns() -> list[ProgressColumn]:
     """Columns for the per-file encode bar."""
     return [
-        TextColumn("[progress.description]{task.description}"),
+        TextColumn(
+            "{task.description}",
+            style='progress.description',
+            markup=False,
+            table_column=Column(no_wrap=True, overflow='ellipsis', ratio=1, min_width=10),
+        ),
         BarColumn(bar_width=BAR_WIDTH),
         TaskProgressColumn(),
         TextColumn("•"),
@@ -206,15 +221,11 @@ def _file_columns() -> list[ProgressColumn]:
     ]
 
 
-def _overall_columns() -> list[ProgressColumn]:
-    """Columns for the top-level batch bar."""
-    return [
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=BAR_WIDTH),
-        MofNCompleteColumn(),
-        TextColumn("files"),
-        TimeElapsedColumn(),
-    ]
+def _print_finished(console: Console, name: str, elapsed: float) -> None:
+    """Archive a one-line summary of a completed file to the scrollback."""
+    suffix = f" finished in {timedelta(seconds=int(elapsed))}"
+    width = max(10, console.width - RIGHT_MARGIN - cell_len(suffix))
+    console.print(_format_description(name, width) + Text(suffix))
 
 
 def run_ffmpeg(args: list[str], progress: Progress, task_id: TaskID) -> None:
@@ -283,18 +294,15 @@ def hevc_convert(
     assert progress is not None
 
     duration = ffprobe_duration(original)
-    description = _format_description(original.name, _description_width())
-    task = progress.add_task(description, total=duration)
+    task = progress.add_task(original.name, total=duration)
+    started = time.monotonic()
     try:
         run_ffmpeg(args, progress, task)
     except subprocess.CalledProcessError as e:
         sys.stderr.write(e.stderr or '')
         raise
-    # Fill the bar, archive it to the scrollback, then drop it from the live region.
-    progress.update(task, total=duration or 1, completed=duration or 1)
-    finished = next(t for t in progress.tasks if t.id == task)
-    progress.console.print(progress.make_tasks_table([finished]))
     progress.remove_task(task)
+    _print_finished(progress.console, original.name, time.monotonic() - started)
 
     dest = original.parent / output_name
     part = dest.with_name(dest.name + '.part')
@@ -322,23 +330,13 @@ def main(options: argparse.Namespace) -> int:
 
         console = Console()
         file_progress = Progress(
-            *_file_columns(), console=console, speed_estimate_period=SPEED_ESTIMATE_PERIOD,
+            *_file_columns(), console=console, expand=True,
+            speed_estimate_period=SPEED_ESTIMATE_PERIOD,
         )
-        overall_progress = Progress(*_overall_columns(), console=console)
 
-        # Show the batch bar only when there is more than one file to convert.
-        overall_task: TaskID | None = None
-        renderables: list[Progress] = [file_progress]
-        if len(files) > 1:
-            description = _format_description('Converting', _description_width())
-            overall_task = overall_progress.add_task(description, total=len(files))
-            renderables = [overall_progress, file_progress]
-
-        with Live(Group(*renderables), console=console, refresh_per_second=10):
+        with Live(_RightMargin(file_progress), console=console, refresh_per_second=10):
             for video in files:
                 hevc_convert(video, temp_folder, options, file_progress)
-                if overall_task is not None:
-                    overall_progress.advance(overall_task)
 
     return 0
 
