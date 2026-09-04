@@ -156,6 +156,30 @@ def build_ffmpeg_args(
     return builder.args()
 
 
+def output_name(original: Path, options: argparse.Namespace) -> str:
+    """
+    Return the name of the file that `original` will be converted into.
+    """
+    suffix = '.mkv' if options.mkv else '.mp4'
+    return original.with_suffix(suffix).name
+
+
+def check_collisions(files: list[Path], options: argparse.Namespace) -> str | None:
+    """
+    Check that no two inputs share an output name, as they would when flattened.
+
+    Returns:
+        Error message, or None if every output name is unique.
+    """
+    seen: dict[str, Path] = {}
+    for video in files:
+        name = output_name(video, options)
+        if name in seen:
+            return f"Duplicate output name {name!r}: {seen[name]} and {video}"
+        seen[name] = video
+    return None
+
+
 def ffprobe_duration(path: Path) -> float | None:
     """
     Return media duration in seconds, or None if unknown.
@@ -271,7 +295,7 @@ def hevc_convert(
     progress: Progress | None = None,
 ) -> None:
     """
-    Convert video in-place.
+    Convert video, in-place unless an output folder was given.
 
     Args:
         original:
@@ -283,10 +307,15 @@ def hevc_convert(
         progress:
             Live display to attach a per-file task to. Unused for dry runs.
     """
-    suffix = '.mkv' if options.mkv else '.mp4'
-    output_name = original.with_suffix(suffix).name
-    output_video = temp_folder / output_name
+    name = output_name(original, options)
+    output_video = temp_folder / name
+    dest = (options.output_dir or original.parent) / name
     args = build_ffmpeg_args(original, output_video, options)
+
+    # Only meaningful with an output folder: in-place, the original is the destination
+    if options.output_dir is not None and dest.exists():
+        print(f"Skipping, output exists: {dest}", file=sys.stderr)
+        return
 
     if options.dry_run:
         print(' '.join(args))
@@ -304,7 +333,6 @@ def hevc_convert(
     progress.remove_task(task)
     _print_finished(progress.console, original.name, time.monotonic() - started)
 
-    dest = original.parent / output_name
     part = dest.with_name(dest.name + '.part')
     shutil.copyfile(output_video, part)
     part.replace(dest)
@@ -319,6 +347,17 @@ def main(options: argparse.Namespace) -> int:
             print(f"Skipping folder: {video}", file=sys.stderr)
         else:
             files.append(video)
+
+    if options.output_dir is not None:
+        if (error := check_collisions(files, options)) is not None:
+            print(error, file=sys.stderr)
+            return 1
+        if not options.dry_run:
+            try:
+                options.output_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"Could not create output folder: {e}", file=sys.stderr)
+                return 1
 
     with TemporaryDirectory(prefix='hevc-convert-') as temp_dir:
         temp_folder = Path(temp_dir)
@@ -346,7 +385,7 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
     Create and run `argparse`-based command parser.
     """
     parser = argparse.ArgumentParser(
-        description="Recompress video files in place",
+        description="Recompress video files, in place by default",
     )
 
     # --animation
@@ -378,6 +417,13 @@ def parse_arguments(args: list[str]) -> argparse.Namespace:
     parser.add_argument(
         '-m', '--mkv', action='store_true',
         help="use '.mkv' as the output file extension instead of '.mp4'",
+    )
+
+    # --output-dir, -o
+    parser.add_argument(
+        '-o', '--output-dir', metavar='DIR', type=Path, default=None,
+        help='write converted files into DIR instead of beside the originals, '
+             'skipping any whose output file already exists',
     )
 
     # --stereo, -s
